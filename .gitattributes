@@ -1,0 +1,2 @@
+# 部署目标是 Linux，统一使用 LF 换行，避免 systemd 单元文件 / Python 脚本在 Windows 检出后带 CRLF
+* text=auto eol=lf
