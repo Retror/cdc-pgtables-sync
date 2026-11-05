@@ -45,6 +45,8 @@ flowchart LR
 
 ## 4. 使用步骤
 
+> 完整的上线步骤（含停机窗口、迁移切换、监控、回退方案）请见 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
+
 ```bash
 cp config.example.json /data/pglsync/config.json      # 按实际情况修改
 export PGLSYNC_SOURCE_PASSWORD='***'                  # 密码不要写进配置文件
