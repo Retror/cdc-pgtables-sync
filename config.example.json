@@ -1,0 +1,59 @@
+{
+  "source": {
+    "host": "127.0.0.1",
+    "port": 5000,
+    "dbname": "typhoon",
+    "user": "postgres",
+    "password_env": "PGLSYNC_SOURCE_PASSWORD"
+  },
+  "target": {
+    "host": "10.0.71.41",
+    "port": 5678,
+    "dbname": "typhoon_sync",
+    "user": "postgres",
+    "password_env": "PGLSYNC_TARGET_PASSWORD"
+  },
+
+  "slot_name": "typhoon_sync_slot",
+  "publication": "typhoon_sync_pub",
+  "state_schema": "pglsync",
+  "publication_mode": "auto",
+  "chunk_schemas": ["_timescaledb_internal"],
+
+  "tables": {
+    "public.base_authorization_fcst_relation": {},
+    "public.base_authorization_info": {},
+    "public.base_authorization_zone_relation": {},
+    "public.base_typhoon_sea_area_dict": {},
+    "public.base_typhoon_dict": {},
+    "public.base_typhoon_level_dict": {},
+    "public.tcrealtime_algorithm": {},
+    "public.base_common_dict": {},
+    "public.fcst_custom_group": {},
+    "public.base_product_type_dict": {},
+    "public.tc_product_published_info": {},
+    "public.tc_product_typhoon_relation": {},
+    "public.tcrealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"},
+    "public.tcensemblerealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"}
+  },
+
+  "apply": {
+    "batch_max_changes": 5000,
+    "batch_max_seconds": 1.0,
+    "upsert_group_size": 500,
+    "on_missing_row": "warn",
+    "chunk_truncate": "warn"
+  },
+
+  "stream": {
+    "status_interval_seconds": 10,
+    "retry_initial_seconds": 5,
+    "retry_max_seconds": 60,
+    "stats_interval_seconds": 60
+  },
+
+  "logging": {
+    "file": "/data/pglsync/pglsync.log",
+    "level": "INFO"
+  }
+}

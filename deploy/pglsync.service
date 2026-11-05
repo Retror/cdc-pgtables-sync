@@ -1,0 +1,22 @@
+[Unit]
+Description=pglsync - PostgreSQL logical replication table sync (typhoon -> typhoon_sync)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postgres
+WorkingDirectory=/data/pglsync/app
+# 密码放在仅 root/postgres 可读的环境文件中（chmod 600），内容示例：
+#   PGLSYNC_SOURCE_PASSWORD=xxxx
+#   PGLSYNC_TARGET_PASSWORD=xxxx
+EnvironmentFile=/data/pglsync/pglsync.env
+ExecStart=/usr/bin/python3 -m pglsync -c /data/pglsync/config.json run
+Restart=always
+RestartSec=10
+# 进程收到 SIGTERM 后会处理完当前事务再退出
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
