@@ -1,0 +1,24 @@
+# 本地测试环境：192.168.234.131（源） -> 192.168.234.132（目标）
+# 使用：java -jar pglsync.jar <命令> --spring.profiles.active=test
+# 测试密码直接写在这里；生产环境请改用 ${环境变量} 形式。
+logging:
+  file:
+    name: logs/pglsync-test.log
+
+pglsync:
+  source:
+    host: 192.168.234.131
+    port: 5432
+    dbname: typhoon
+    user: postgres
+    password: 123456
+  target:
+    host: 192.168.234.132
+    port: 5432
+    dbname: typhoon
+    user: postgres
+    password: 123456
+
+  # 与 Python 版使用不同的复制槽 / 发布名，两套程序不会互相干扰（但不要同时向同一目标库同步）
+  slot-name: pglsync_java_test_slot
+  publication: pglsync_java_test_pub

@@ -10,6 +10,16 @@ PostgreSQL 数据单向同步工具 **pglsync**。它基于 PostgreSQL 逻辑复
 | [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) | 生产上线手册：从旧触发器方案切换、监控、回退 |
 | [docs/LOGICAL_SYNC.md](docs/LOGICAL_SYNC.md) | 方案原理、与旧方案的对比、限制 |
 | [docs/TEST_ENV_SETUP.md](docs/TEST_ENV_SETUP.md) | 测试环境（131 → 132）速查 |
+| [pglsync-java/README.md](pglsync-java/README.md) | **Java 版**（Spring Boot 2.7 + JDK 8）：构建、配置、命令写法 |
+
+## 两种实现
+
+| 实现 | 目录 | 运行方式 |
+|---|---|---|
+| Python 版 | `pglsync/` | `python3 -m pglsync -c config.json <命令>` |
+| Java 版 | `pglsync-java/` | `java -jar pglsync.jar <命令> [--选项=值]` |
+
+两者功能、同步逻辑、目标库位点表结构完全一致，任选其一部署即可（不要同时向同一目标库同步）。
 
 ## 快速开始
 

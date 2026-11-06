@@ -1,0 +1,24 @@
+[Unit]
+Description=pglsync (Java) - PostgreSQL logical replication table sync
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postgres
+WorkingDirectory=/opt/pglsync-java
+# 密码放在仅 root/postgres 可读的环境文件中（chmod 600），内容示例：
+#   PGLSYNC_SOURCE_PASSWORD=xxxx
+#   PGLSYNC_TARGET_PASSWORD=xxxx
+EnvironmentFile=-/opt/pglsync-java/pglsync.env
+ExecStart=/usr/bin/java -Xms256m -Xmx1g -jar /opt/pglsync-java/pglsync.jar run \
+    --spring.config.additional-location=file:/opt/pglsync-java/application.yml
+Restart=always
+RestartSec=10
+# 收到 SIGTERM 后会处理完当前事务再退出
+KillSignal=SIGTERM
+TimeoutStopSec=120
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target

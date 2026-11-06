@@ -1,0 +1,74 @@
+# pglsync 默认配置（生产模板）。密码通过环境变量提供，不要写进配置文件。
+# 测试环境使用 application-test.yml：java -jar pglsync.jar <命令> --spring.profiles.active=test
+spring:
+  main:
+    banner-mode: off
+    log-startup-info: false
+    web-application-type: none
+
+logging:
+  file:
+    name: logs/pglsync.log
+  logback:
+    rollingpolicy:
+      max-file-size: 50MB
+      max-history: 10
+  level:
+    root: INFO
+    com.retror.pglsync: INFO
+
+pglsync:
+  source:
+    host: 127.0.0.1
+    port: 5000
+    dbname: typhoon
+    user: postgres
+    password: ${PGLSYNC_SOURCE_PASSWORD:}
+  target:
+    host: 10.0.71.41
+    port: 5678
+    dbname: typhoon_sync
+    user: postgres
+    password: ${PGLSYNC_TARGET_PASSWORD:}
+
+  slot-name: typhoon_sync_slot
+  publication: typhoon_sync_pub
+  state-schema: pglsync
+  publication-mode: auto            # auto / schema / all
+  chunk-schemas:
+    - _timescaledb_internal
+
+  tables:
+    - name: public.base_authorization_fcst_relation
+    - name: public.base_authorization_info
+    - name: public.base_authorization_zone_relation
+    - name: public.base_typhoon_sea_area_dict
+    - name: public.base_typhoon_dict
+    - name: public.base_typhoon_level_dict
+    - name: public.tcrealtime_algorithm
+    - name: public.base_common_dict
+    - name: public.fcst_custom_group
+    - name: public.base_product_type_dict
+    - name: public.tc_product_published_info
+    - name: public.tc_product_typhoon_relation
+    - name: public.tcrealtime
+      pk: [id, datatime]
+      time-column: datatime
+      bucket: day
+    - name: public.tcensemblerealtime
+      pk: [id, datatime]
+      time-column: datatime
+      bucket: day
+
+  apply:
+    batch-max-changes: 5000
+    batch-max-seconds: 1.0
+    upsert-group-size: 500
+    on-missing-row: warn            # warn / error
+    chunk-truncate: warn            # warn / error
+
+  stream:
+    status-interval-seconds: 10
+    retry-initial-seconds: 5
+    retry-max-seconds: 60
+    stats-interval-seconds: 60
