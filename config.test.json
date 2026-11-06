@@ -23,6 +23,18 @@
   "chunk_schemas": ["_timescaledb_internal"],
 
   "tables": {
+    "public.base_authorization_fcst_relation": {},
+    "public.base_authorization_info": {},
+    "public.base_authorization_zone_relation": {},
+    "public.base_typhoon_sea_area_dict": {},
+    "public.base_typhoon_dict": {},
+    "public.base_typhoon_level_dict": {},
+    "public.tcrealtime_algorithm": {},
+    "public.base_common_dict": {},
+    "public.fcst_custom_group": {},
+    "public.base_product_type_dict": {},
+    "public.tc_product_published_info": {},
+    "public.tc_product_typhoon_relation": {},
     "public.tcrealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"},
     "public.tcensemblerealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"}
   },

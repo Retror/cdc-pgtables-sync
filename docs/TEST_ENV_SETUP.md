@@ -143,6 +143,8 @@ psql -h 192.168.234.131 -p 5432 -U postgres -d typhoon -c "select 1"
 
 ## 3. 在两个库上建表
 
+> 如果 131 和 132 上已经建好表、而且数据已经同步过，可以跳过本节，直接看第 4 节的“情况 A”。
+
 ### 方式 A：导出生产表结构（推荐，和生产完全一致）
 
 ```bash
@@ -191,11 +193,53 @@ pip3 install -r requirements.txt     # Windows 上：pip install -r requirements
 
 python3 -m pglsync -c config.test.json check     # 1. 检查 131 的参数，必须没有“问题”才能继续
 python3 -m pglsync -c config.test.json setup     # 2. 在 131 上创建发布 pglsync_test_pub
-python3 -m pglsync -c config.test.json init -y   # 3. 创建复制槽，并全量复制到 132（会清空 132 上的这两张表）
+```
+
+第 3 步按 132 的现状二选一：
+
+### 情况 A：132 上已经有和 131 一致的数据（不想重新全量复制）
+
+```bash
+python3 -m pglsync -c config.test.json init --no-copy   # 3. 创建复制槽，核对两边数据，一致就从当前位置开始同步
+```
+
+`--no-copy` 的过程：
+
+1. 在 131 上创建复制槽，同时得到一个**一致性快照**和对应的 WAL 位点；
+2. 用这个快照读取 131，和 132 逐表比较行数和整行哈希。超表按天比较，能定位到具体日期；
+3. 全部一致：不改动 132 上的任何业务数据，只记录同步位点，之后从这个位点开始增量同步；
+4. 有不一致：**默认放弃初始化**，删除刚建的复制槽，不做任何修改，并列出哪些表、哪几天对不上。
+
+有不一致时可以这样处理：
+
+```bash
+python3 -m pglsync -c config.test.json init --no-copy --on-mismatch copy   # 只重新复制不一致的表，其他表不动
+python3 -m pglsync -c config.test.json init                                # 或者全部重新复制
+```
+
+> [!TIP]
+> 比较用的是快照，所以初始化期间 131 可以照常写入，不需要停业务（`load_writer.py` 可以继续跑）。快照之前的写入必须已经在 132 上才算一致；快照之后的写入由增量同步补上。
+>
+> 只要从上次同步到现在 131 有过新的写入、而 132 还没收到，比较就会显示不一致。这时用 `--on-mismatch copy` 只补这些表即可。
+
+数据量非常大、核对耗时太长时，可以加 `--skip-verify` 跳过核对，但要**自己确保**此刻两边完全一致，并且 131 上没有写入。否则差异会一直留在 132 上，只能靠 `reconcile` 发现。
+
+### 情况 B：132 是空表，或者数据不可信
+
+```bash
+python3 -m pglsync -c config.test.json init      # 3. 创建复制槽，并全量复制到 132（会清空 132 上配置的这些表）
+```
+
+### 启动增量同步
+
+```bash
 python3 -m pglsync -c config.test.json run       # 4. 前台运行增量同步，Ctrl+C 停止
 ```
 
 `run` 会一直占用终端，所以后面的写入和验证命令请另开一个终端执行。日志同时写入 `logs/pglsync-test.log`。
+
+> [!NOTE]
+> [config.test.json](../config.test.json) 已配置全部 14 张表。如果 131 上的某些表还没有和 132 对齐，可以直接用 `--on-mismatch copy`，或者先把这些表从 `tables` 里删掉。
 
 ---
 

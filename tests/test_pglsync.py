@@ -82,6 +82,12 @@ class FakeCursor(object):
         self.executed.append((sql, list(params) if params is not None else None))
         self.rowcount = self.default_rowcount
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 class FakeConn(object):
     def __init__(self, rowcount=1):
@@ -371,6 +377,53 @@ class SessionTest(unittest.TestCase):
         s.last_idle_feedback = 0
         s._idle_feedback(now=1e9)
         self.assertEqual(cur.feedback, [500])
+
+
+class VerifySnapshotTest(unittest.TestCase):
+    """init --no-copy 的快照核对逻辑（bucket_hashes 用假数据替换）。"""
+
+    def setUp(self):
+        from pglsync import snapshot
+        self.snapshot = snapshot
+        self._orig = snapshot.bucket_hashes
+        self.data = {}
+
+        def fake(conn, table, cols, pk, since=None, bucket=None):
+            return self.data[(conn.side, table.qualified)]
+        snapshot.bucket_hashes = fake
+
+    def tearDown(self):
+        self.snapshot.bucket_hashes = self._orig
+
+    def _conns(self):
+        snap, tgt = FakeConn(), FakeConn()
+        snap.side, tgt.side = 'src', 'tgt'
+        return snap, tgt
+
+    def _plan(self):
+        a = TableConfig('public', 'a')
+        h = TableConfig('public', 'h', pk=['id', 'ts'], time_column='ts')
+        return [(a, ['id', 'v'], ['id']), (h, ['id', 'ts', 'v'], ['id', 'ts'])]
+
+    def test_all_consistent(self):
+        self.data = {('src', 'public.a'): {'*': (3, 'x')}, ('tgt', 'public.a'): {'*': (3, 'x')},
+                     ('src', 'public.h'): {'2026-11-01': (5, 'y')}, ('tgt', 'public.h'): {'2026-11-01': (5, 'y')}}
+        snap, tgt = self._conns()
+        self.assertEqual(self.snapshot._verify_against_snapshot(snap, tgt, self._plan(), 'abort'), [])
+        # 两边都设置了相同的会话参数
+        self.assertTrue(any('TimeZone' in s for s, _ in snap.cursor_obj.executed))
+        self.assertTrue(any('TimeZone' in s for s, _ in tgt.cursor_obj.executed))
+
+    def test_mismatch_policies(self):
+        self.data = {('src', 'public.a'): {'*': (3, 'x')}, ('tgt', 'public.a'): {'*': (3, 'x')},
+                     ('src', 'public.h'): {'2026-11-01': (5, 'y'), '2026-11-02': (1, 'z')},
+                     ('tgt', 'public.h'): {'2026-11-01': (5, 'y')}}
+        plan = self._plan()
+        with self.assertRaises(ConfigError):
+            self.snapshot._verify_against_snapshot(*self._conns(), plan=plan, on_mismatch='abort')
+        to_copy = self.snapshot._verify_against_snapshot(*self._conns(), plan=plan, on_mismatch='copy')
+        self.assertEqual([t.qualified for t, _, _ in to_copy], ['public.h'])
+        self.assertEqual(self.snapshot._verify_against_snapshot(*self._conns(), plan=plan, on_mismatch='ignore'), [])
 
 
 if __name__ == '__main__':

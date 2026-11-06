@@ -7,6 +7,16 @@ init：创建复制槽并基于其导出的一致性快照做全量复制。
   2. 另开源库连接 SET TRANSACTION SNAPSHOT，读取到的数据恰好是 consistent_point 时刻的状态；
   3. 目标库在 **一个事务** 中 TRUNCATE + COPY 全部表，并写入位点 = consistent_point；
   4. 之后 run 从 consistent_point 开始增量同步，全量与增量之间不重不漏。
+
+init --no-copy：目标库已经有数据（例如之前已手工同步过），不想重新全量复制时使用。
+  1. 同样创建复制槽、拿到一致性快照；
+  2. 用该快照读取源库，与目标库逐表比较（按时间桶的行数 + 整行哈希），
+     确认目标库恰好等于 consistent_point 时刻的源库状态；
+  3. 一致则直接写入位点 = consistent_point；不一致的表按 --on-mismatch 处理：
+       abort（默认）：放弃初始化并删除复制槽，不做任何修改；
+       copy        ：只对不一致的表用快照重新 TRUNCATE + COPY；
+       ignore      ：保留差异（不推荐），直接从 consistent_point 开始同步。
+  比较基于快照，所以初始化期间源库可以照常写入，不需要停业务。
 """
 import logging
 import os
@@ -15,6 +25,7 @@ import time
 
 from .catalog import resolve_pk, table_columns, table_exists, unique_key_sets
 from .config import ConfigError
+from .reconcile import SESSION_SETTINGS, bucket_hashes
 from .state import ensure_state_table, write_state
 from .utils import int_to_lsn, lsn_to_int, qi, qname
 
@@ -96,13 +107,62 @@ def _preflight(cfg, src_cur, tgt_cur):
         if frozenset(pk) not in unique_key_sets(tgt_cur, table.schema, table.name):
             problems.append('目标表 %s 上没有与主键 %s 完全一致的唯一约束（ON CONFLICT 需要）'
                             % (table.qualified, pk))
-        plan.append((table, src_cols))
+        plan.append((table, src_cols, pk))
     if problems:
         raise ConfigError('init 前置检查失败:\n  - ' + '\n  - '.join(problems))
     return plan
 
 
-def run_init(cfg, assume_yes=False, recreate_slot=False):
+def _verify_against_snapshot(snap, tgt, plan, on_mismatch):
+    """用快照读取源库，与目标库逐表比较。返回需要重新复制的 plan 子集。
+
+    snap 已处于 SET TRANSACTION SNAPSHOT 之后的事务中；比较结果代表 consistent_point 时刻。
+    """
+    for conn in (snap, tgt):
+        with conn.cursor() as cur:
+            for stmt in SESSION_SETTINGS:
+                cur.execute(stmt)
+
+    print('\n%-45s %14s %14s  %s' % ('表', '源库(快照)行数', '目标库行数', '结果'))
+    print('-' * 95)
+    mismatched = []
+    for item in plan:
+        table, cols, pk = item
+        started = time.time()
+        s = bucket_hashes(snap, table, cols, pk)
+        t = bucket_hashes(tgt, table, cols, pk)
+        bad = sorted(b for b in set(s) | set(t) if s.get(b) != t.get(b))
+        status = '一致' if not bad else '不一致: %d 个%s' % (len(bad), '时间桶' if table.time_column else '表')
+        print('%-45s %14s %14s  %s  (%.1fs)' % (
+            table.qualified, '{:,}'.format(sum(v[0] for v in s.values())),
+            '{:,}'.format(sum(v[0] for v in t.values())), status, time.time() - started))
+        if bad:
+            mismatched.append(item)
+            if table.time_column:
+                for b in bad[:10]:
+                    print('    %-28s 源 %10s  目标 %10s' % (
+                        b, '{:,}'.format(s.get(b, (0,))[0]), '{:,}'.format(t.get(b, (0,))[0])))
+                if len(bad) > 10:
+                    print('    ... 另有 %d 个桶不一致' % (len(bad) - 10))
+    print('-' * 95)
+
+    if not mismatched:
+        log.info('所有表与源库快照一致，直接从一致性位点开始同步')
+        return []
+    names = ', '.join(t.qualified for t, _, _ in mismatched)
+    if on_mismatch == 'abort':
+        raise ConfigError('以下表与源库不一致: %s\n'
+                          '  未做任何修改。可选择：\n'
+                          '  - init --no-copy --on-mismatch copy   只重新复制这些表\n'
+                          '  - init（不带 --no-copy）               全部重新复制' % names)
+    if on_mismatch == 'copy':
+        log.warning('以下表与源库不一致，将用快照重新复制: %s', names)
+        return mismatched
+    log.warning('以下表与源库不一致，按 --on-mismatch ignore 保留差异: %s', names)
+    return []
+
+
+def run_init(cfg, assume_yes=False, recreate_slot=False, copy=True, verify=True, on_mismatch='abort'):
     import psycopg2
     import psycopg2.extensions
     from psycopg2.extras import LogicalReplicationConnection
@@ -129,9 +189,21 @@ def run_init(cfg, assume_yes=False, recreate_slot=False):
             plan = _preflight(cfg, scur, tcur)
         tgt.commit()
 
-        print('\n即将对目标库 %s@%s 执行全量初始化，以下表会被 TRUNCATE 后重新复制:'
-              % (cfg.target.get('dbname'), cfg.target.get('host')))
-        for table, _ in plan:
+        if copy:
+            print('\n即将对目标库 %s@%s 执行全量初始化，以下表会被 TRUNCATE 后重新复制:'
+                  % (cfg.target.get('dbname'), cfg.target.get('host')))
+        else:
+            print('\n即将以目标库 %s@%s 的现有数据为起点初始化（不重新全量复制）。'
+                  % (cfg.target.get('dbname'), cfg.target.get('host')))
+            if verify:
+                print('会先用一致性快照逐表核对源库与目标库，不一致时的处理方式: %s' % {
+                    'abort': '放弃初始化，不做任何修改',
+                    'copy': '仅对不一致的表 TRUNCATE 后重新复制',
+                    'ignore': '保留差异，直接开始同步（不推荐）'}[on_mismatch])
+            else:
+                print('已指定 --skip-verify：不核对数据，请自行确保两边此刻完全一致！')
+            print('涉及的表:')
+        for table, _, _ in plan:
             print('  - %s' % table.qualified)
         if not assume_yes:
             answer = input('\n输入 yes 继续: ').strip().lower()
@@ -151,29 +223,40 @@ def run_init(cfg, assume_yes=False, recreate_slot=False):
         start_lsn = lsn_to_int(consistent_point)
         log.info('已创建复制槽 %s，一致性位点 %s，快照 %s', cfg.slot_name, consistent_point, snapshot_name)
 
-        # 注意：repl 连接在复制完成前必须保持打开且不执行其他命令，否则导出的快照失效
+        # 注意：repl 连接在复制/核对完成前必须保持打开且不执行其他命令，否则导出的快照失效
         snap = psycopg2.connect(**cfg.source)
         snap.set_session(isolation_level=psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ, readonly=True)
         with snap.cursor() as cur:
             cur.execute('SET TRANSACTION SNAPSHOT %s', (snapshot_name,))
 
         total_start = time.time()
+        if copy:
+            to_copy = plan
+        elif verify:
+            to_copy = _verify_against_snapshot(snap, tgt, plan, on_mismatch)
+        else:
+            to_copy = []
+
+        copied = []
         with tgt.cursor() as tcur:
-            for table, cols in plan:
+            for table, cols, _ in to_copy:
                 started = time.time()
                 tcur.execute('TRUNCATE TABLE %s' % qname(table.schema, table.name))
                 rows = _copy_table(snap, tcur, table, cols)
+                copied.append(table)
                 log.info('已复制 %-45s %12s 行  %.1fs', table.qualified,
                          '{:,}'.format(rows) if rows is not None and rows >= 0 else '?', time.time() - started)
             write_state(tcur, cfg.state_schema, cfg.slot_name, start_lsn)
         tgt.commit()
         snap.commit()
-        log.info('全量复制完成，耗时 %.1fs，同步位点已设为 %s', time.time() - total_start, int_to_lsn(start_lsn))
+        log.info('初始化完成，耗时 %.1fs，重新复制 %d 张表，同步位点已设为 %s',
+                 time.time() - total_start, len(copied), int_to_lsn(start_lsn))
 
-        tgt.autocommit = True
-        with tgt.cursor() as tcur:
-            for table, _ in plan:
-                tcur.execute('ANALYZE %s' % qname(table.schema, table.name))
+        if copied:
+            tgt.autocommit = True
+            with tgt.cursor() as tcur:
+                for table in copied:
+                    tcur.execute('ANALYZE %s' % qname(table.schema, table.name))
         print('\n初始化完成。接下来请启动增量同步: python -m pglsync -c %s run' % (cfg.path or 'config.json'))
         return 0
     except BaseException:

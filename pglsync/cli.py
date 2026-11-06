@@ -43,9 +43,16 @@ def build_parser():
                    help='对缺少复制标识的表执行 REPLICA IDENTITY FULL')
     s.add_argument('--force', action='store_true', help='忽略复制标识检查（风险自负）')
 
-    s = sub.add_parser('init', help='创建复制槽，并以一致性快照全量复制到目标库（会 TRUNCATE 目标表）')
+    s = sub.add_parser('init', help='创建复制槽，并以一致性快照全量复制到目标库（会 TRUNCATE 目标表）；'
+                                    '目标库已有数据时用 --no-copy')
     s.add_argument('-y', '--yes', action='store_true', help='不再交互确认')
     s.add_argument('--recreate-slot', action='store_true', help='删除已存在的复制槽后重新初始化')
+    s.add_argument('--no-copy', action='store_true',
+                   help='不全量复制，以目标库现有数据为起点（会先用快照核对两边是否一致）')
+    s.add_argument('--on-mismatch', choices=('abort', 'copy', 'ignore'), default='abort',
+                   help='--no-copy 核对发现不一致时：abort 放弃（默认）/ copy 只重新复制不一致的表 / ignore 保留差异')
+    s.add_argument('--skip-verify', action='store_true',
+                   help='--no-copy 时跳过核对（数据量极大时使用，需自行保证两边一致）')
 
     sub.add_parser('run', help='启动增量同步（常驻进程）')
     sub.add_parser('status', help='查看复制槽积压与同步位点')
@@ -82,7 +89,10 @@ def main(argv=None):
             return run_setup(cfg, apply=True, fix_ri=args.fix_replica_identity, force=args.force)
         if args.command == 'init':
             from .snapshot import run_init
-            return run_init(cfg, assume_yes=args.yes, recreate_slot=args.recreate_slot)
+            if (args.skip_verify or args.on_mismatch != 'abort') and not args.no_copy:
+                raise ConfigError('--skip-verify / --on-mismatch 只能与 --no-copy 一起使用')
+            return run_init(cfg, assume_yes=args.yes, recreate_slot=args.recreate_slot,
+                            copy=not args.no_copy, verify=not args.skip_verify, on_mismatch=args.on_mismatch)
         if args.command == 'run':
             from .stream import Streamer
             streamer = Streamer(cfg)
