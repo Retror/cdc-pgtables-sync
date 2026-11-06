@@ -1,0 +1,49 @@
+{
+  "_comment": "本地测试环境：192.168.234.131（源） -> 192.168.234.132（目标）。测试密码直接写在这里；生产环境请改用 password_env 从环境变量读取。",
+
+  "source": {
+    "host": "192.168.234.131",
+    "port": 5432,
+    "dbname": "typhoon",
+    "user": "postgres",
+    "password": "123456"
+  },
+  "target": {
+    "host": "192.168.234.132",
+    "port": 5432,
+    "dbname": "typhoon",
+    "user": "postgres",
+    "password": "123456"
+  },
+
+  "slot_name": "pglsync_test_slot",
+  "publication": "pglsync_test_pub",
+  "state_schema": "pglsync",
+  "publication_mode": "auto",
+  "chunk_schemas": ["_timescaledb_internal"],
+
+  "tables": {
+    "public.tcrealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"},
+    "public.tcensemblerealtime": {"pk": ["id", "datatime"], "time_column": "datatime", "bucket": "day"}
+  },
+
+  "apply": {
+    "batch_max_changes": 5000,
+    "batch_max_seconds": 1.0,
+    "upsert_group_size": 500,
+    "on_missing_row": "warn",
+    "chunk_truncate": "warn"
+  },
+
+  "stream": {
+    "status_interval_seconds": 10,
+    "retry_initial_seconds": 5,
+    "retry_max_seconds": 60,
+    "stats_interval_seconds": 60
+  },
+
+  "logging": {
+    "file": "logs/pglsync-test.log",
+    "level": "INFO"
+  }
+}

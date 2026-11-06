@@ -3,4 +3,5 @@ __pycache__/
 config.json
 *.env
 *.log
+logs/
 .cdc_last_id
