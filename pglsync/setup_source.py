@@ -116,10 +116,15 @@ def find_bad_replica_identity(cur, cfg, mode, chunk_schemas):
 
 
 def _hypertable_root(cur, schema, name):
+    # chunk 是超表的继承子表；用 pg_inherits 查找，不依赖 TimescaleDB 内部目录的列名
     cur.execute("""
-        SELECT h.schema_name, h.table_name FROM _timescaledb_catalog.chunk c
-        JOIN _timescaledb_catalog.hypertable h ON h.id = c.hypertable_id
-        WHERE c.schema_name = %s AND c.table_name = %s
+        SELECT pn.nspname, p.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_inherits i ON i.inhrelid = c.oid
+        JOIN pg_class p ON p.oid = i.inhparent
+        JOIN pg_namespace pn ON pn.oid = p.relnamespace
+        WHERE n.nspname = %s AND c.relname = %s
     """, (schema, name))
     row = cur.fetchone()
     return (row[0], row[1]) if row else None

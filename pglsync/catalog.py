@@ -62,7 +62,9 @@ class RelationRegistry(object):
     def hypertable_of(self, schema, name):
         """chunk -> (超表 schema, 超表名)；不是 chunk 或已无法找到时返回 None。
 
-        查询异常会直接抛出（由上层重连重试），不会被缓存成“跳过”。
+        通过 PostgreSQL 自身的继承关系（pg_inherits）查找：TimescaleDB 的 chunk 都是超表的继承子表，
+        这种方式不依赖 _timescaledb_catalog 内部表结构（其列名在不同 TimescaleDB 版本间有变化）。
+        主查询异常会直接抛出（由上层重连重试），不会被缓存成“跳过”。
         """
         key = (schema, name)
         if key in self._chunk_cache:
@@ -70,19 +72,18 @@ class RelationRegistry(object):
         cur = self._cursor()
         try:
             cur.execute("""
-                SELECT h.schema_name, h.table_name
-                FROM _timescaledb_catalog.chunk c
-                JOIN _timescaledb_catalog.hypertable h ON h.id = c.hypertable_id
-                WHERE c.schema_name = %s AND c.table_name = %s
+                SELECT pn.nspname, p.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_inherits i ON i.inhrelid = c.oid
+                JOIN pg_class p ON p.oid = i.inhparent
+                JOIN pg_namespace pn ON pn.oid = p.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
             """, (schema, name))
             row = cur.fetchone()
             if row is None:
                 # chunk 可能已被 drop_chunks 删除，按命名规则 _hyper_<超表id>_<n>_chunk 兜底
-                m = _CHUNK_NAME_RE.match(name)
-                if m:
-                    cur.execute('SELECT schema_name, table_name FROM _timescaledb_catalog.hypertable '
-                                'WHERE id = %s', (int(m.group(1)),))
-                    row = cur.fetchone()
+                row = self._hypertable_by_chunk_name(cur, name)
         finally:
             cur.close()
         result = (row[0], row[1]) if row else None
@@ -90,6 +91,19 @@ class RelationRegistry(object):
             log.warning('无法找到 chunk %s.%s 所属的超表，其变更将被忽略', schema, name)
         self._chunk_cache[key] = result
         return result
+
+    @staticmethod
+    def _hypertable_by_chunk_name(cur, name):
+        m = _CHUNK_NAME_RE.match(name)
+        if not m:
+            return None
+        try:
+            cur.execute('SELECT schema_name, table_name FROM _timescaledb_catalog.hypertable WHERE id = %s',
+                        (int(m.group(1)),))
+            return cur.fetchone()
+        except Exception as e:   # 内部目录结构不兼容时放弃兜底（连接为 autocommit，不影响后续查询）
+            log.warning('按 chunk 名称查找超表失败: %s', e)
+            return None
 
     # ---------- Relation 消息 ----------
     def register(self, rel):
