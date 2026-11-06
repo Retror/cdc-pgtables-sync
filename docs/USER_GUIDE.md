@@ -8,7 +8,7 @@
 4. 测试写入脚本的使用方式
 5. 端到端测试流程、常见问题排查、生产切换要点
 
-> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
+> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
 
 ---
 
@@ -672,6 +672,9 @@ python3 -m pglsync -c $C drop -y          # 必须执行，否则 131 会持续�
 1. **pglsync 不同步 DDL（表结构变更）。** 新建表、加列、改类型等操作，都必须在源库和目标库**分别执行**，两边保持一致。
 2. **结构不匹配不会丢数据。** 两边结构对不上时，`run` 会报错并自动重试，复制槽继续保留 WAL。把结构改一致后，程序会从断点自动继续。所以就算操作顺序错了也能补救，只要别让 WAL 积压太久。
 3. **万能补救手段是 `resync -t 表名`。** 它会用源库当前的快照把这张表重新复制一遍，并且让增量同步跳过这张表在快照之前的旧变更。**不管做了什么结构变更，只要执行一次 `resync`，这张表就一定是一致的。** 代价是整表复制：大表比较耗时，复制期间目标库的这张表会被锁住。
+
+> [!NOTE]
+> 新增或修改表**不需要**重新同步其他表，主复制槽也不会重建。原理见 [REPLICATION_SLOT.md 第 5.4 节](REPLICATION_SLOT.md#54-resync主复制槽不动只给某几张表重新建立起点)。
 
 ### 8.2 `resync` 命令说明
 
