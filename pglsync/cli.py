@@ -55,6 +55,10 @@ def build_parser():
                    help='--no-copy 时跳过核对（数据量极大时使用，需自行保证两边一致）')
 
     sub.add_parser('run', help='启动增量同步（常驻进程）')
+
+    s = sub.add_parser('resync', help='重新全量复制指定表（新增同步表、表结构变更后使用），需先停止 run')
+    s.add_argument('-t', '--table', action='append', required=True, help='要重新复制的表（可多次指定）')
+    s.add_argument('-y', '--yes', action='store_true', help='不再交互确认')
     sub.add_parser('status', help='查看复制槽积压与同步位点')
 
     s = sub.add_parser('reconcile', help='核对源库与目标库数据（行数 + 整行哈希）')
@@ -101,6 +105,9 @@ def main(argv=None):
             log.info('pglsync %s 启动，同步 %d 张表', __version__, len(cfg.tables))
             streamer.run_forever()
             return 0
+        if args.command == 'resync':
+            from .snapshot import run_resync
+            return run_resync(cfg, args.table, assume_yes=args.yes)
         if args.command == 'status':
             from .admin import run_status
             return run_status(cfg)

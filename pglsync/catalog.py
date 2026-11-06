@@ -14,7 +14,7 @@ _CHUNK_NAME_RE = re.compile(r'^_hyper_(\d+)_\d+_chunk$')
 class RelationInfo(object):
     """一个源库 relation（pgoutput 的 relid）及其映射到的目标表。"""
     __slots__ = ('relid', 'namespace', 'name', 'replident', 'col_names',
-                 'key_cols', 'target', 'pk', 'is_chunk')
+                 'key_cols', 'target', 'pk', 'is_chunk', 'invalid')
 
     def __init__(self, relid, namespace, name, replident, col_names, key_cols,
                  target=None, pk=None, is_chunk=False):
@@ -27,6 +27,7 @@ class RelationInfo(object):
         self.target = target      # TableConfig；None 表示该表不需要同步
         self.pk = pk              # 目标表主键列（用于 ON CONFLICT / WHERE）
         self.is_chunk = is_chunk
+        self.invalid = None       # 校验失败原因；应用该 relation 的变更时才报错
 
     @property
     def source_name(self):
@@ -122,25 +123,35 @@ class RelationRegistry(object):
 
         table = self.cfg.tables.get(target_key) if target_key else None
         if table is not None:
-            pk = table.pk or key_cols
-            if not pk:
-                raise ConfigError('表 %s 没有主键（复制标识），请在配置中指定 pk 或为源表添加主键'
-                                  % table.qualified)
-            missing = [c for c in pk if c not in col_names]
-            if missing:
-                raise ConfigError('表 %s 配置的主键列 %s 在源表中不存在' % (table.qualified, missing))
-            not_in_identity = [c for c in pk if c not in key_cols]
-            if not_in_identity:
-                raise ConfigError(
-                    '表 %s（源 relation %s）的复制标识不包含主键列 %s，DELETE/UPDATE 将无法定位目标行。'
-                    '请为源表设置主键，或执行 ALTER TABLE ... REPLICA IDENTITY FULL'
-                    % (table.qualified, info.source_name, not_in_identity))
             info.target = table
-            info.pk = list(pk)
-            log.debug('relation %s (relid=%d) -> %s pk=%s', info.source_name, rel.relid,
-                      table.qualified, info.pk)
+            try:
+                info.pk = self._validate(table, info)
+                log.debug('relation %s (relid=%d) -> %s pk=%s', info.source_name, rel.relid,
+                          table.qualified, info.pk)
+            except ConfigError as e:
+                # 不立即报错：这可能是表结构变更前的旧 Relation，其变更会因 resync 位点而被跳过。
+                # 真正需要应用该 relation 的变更时才报错（见 stream._Session._check_info）。
+                info.invalid = str(e)
+                log.debug('relation %s 暂不可用: %s', info.source_name, e)
         self._rels[rel.relid] = info
         return info
+
+    @staticmethod
+    def _validate(table, info):
+        pk = table.pk or info.key_cols
+        if not pk:
+            raise ConfigError('表 %s 没有主键（复制标识），请在配置中指定 pk 或为源表添加主键'
+                              % table.qualified)
+        missing = [c for c in pk if c not in info.col_names]
+        if missing:
+            raise ConfigError('表 %s 配置的主键列 %s 在源表中不存在' % (table.qualified, missing))
+        not_in_identity = [c for c in pk if c not in info.key_cols]
+        if not_in_identity:
+            raise ConfigError(
+                '表 %s（源 relation %s）的复制标识不包含主键列 %s，DELETE/UPDATE 将无法定位目标行。'
+                '请为源表设置主键，或执行 ALTER TABLE ... REPLICA IDENTITY FULL'
+                % (table.qualified, info.source_name, not_in_identity))
+        return list(pk)
 
     def get(self, relid):
         try:

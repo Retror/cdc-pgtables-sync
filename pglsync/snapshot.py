@@ -26,7 +26,7 @@ import time
 from .catalog import resolve_pk, table_columns, table_exists, unique_key_sets
 from .config import ConfigError
 from .reconcile import SESSION_SETTINGS, bucket_hashes
-from .state import ensure_state_table, write_state
+from .state import clear_table_states, ensure_state_table, read_state, write_state, write_table_state
 from .utils import int_to_lsn, lsn_to_int, qi, qname
 
 log = logging.getLogger('pglsync.init')
@@ -80,11 +80,11 @@ def _drop_slot(src_params, slot):
         conn.close()
 
 
-def _preflight(cfg, src_cur, tgt_cur):
-    """检查表结构，返回 [(TableConfig, 源列列表)]。"""
+def _preflight(cfg, src_cur, tgt_cur, tables=None):
+    """检查表结构，返回 [(TableConfig, 源列列表, 主键)]。"""
     plan = []
     problems = []
-    for table in cfg.tables.values():
+    for table in (tables if tables is not None else cfg.tables.values()):
         if not table_exists(src_cur, table.schema, table.name):
             problems.append('源库不存在表 %s' % table.qualified)
             continue
@@ -247,6 +247,7 @@ def run_init(cfg, assume_yes=False, recreate_slot=False, copy=True, verify=True,
                 log.info('已复制 %-45s %12s 行  %.1fs', table.qualified,
                          '{:,}'.format(rows) if rows is not None and rows >= 0 else '?', time.time() - started)
             write_state(tcur, cfg.state_schema, cfg.slot_name, start_lsn)
+            clear_table_states(tcur, cfg.state_schema, cfg.slot_name)
         tgt.commit()
         snap.commit()
         log.info('初始化完成，耗时 %.1fs，重新复制 %d 张表，同步位点已设为 %s',
@@ -275,6 +276,122 @@ def run_init(cfg, assume_yes=False, recreate_slot=False, copy=True, verify=True,
                 log.exception('删除复制槽失败，请手动执行: SELECT pg_drop_replication_slot(%r);', cfg.slot_name)
         raise
     finally:
+        for conn in (snap, repl, tgt, src):
+            if conn is not None and not conn.closed:
+                conn.close()
+
+
+# ---------------------------------------------------------------------------
+# resync：在不重建主复制槽的情况下，重新全量复制指定的表
+# ---------------------------------------------------------------------------
+
+def _resolve_tables(cfg, names):
+    tables, unknown = [], []
+    for name in names:
+        key = name if '.' in name else 'public.%s' % name
+        table = cfg.tables.get(key)
+        if table is None:
+            unknown.append(name)
+        elif table not in tables:
+            tables.append(table)
+    if unknown:
+        raise ConfigError('表 %s 不在配置文件的 tables 中，请先把它加入配置' % ', '.join(unknown))
+    return tables
+
+
+def run_resync(cfg, names, assume_yes=False):
+    """
+    重新全量复制指定的表（新增同步表、表结构变更、单表数据不一致时使用）。
+
+      1. 要求主复制槽存在且没有进程在使用（run 已停止）；
+      2. 创建一个 **临时** 复制槽并导出快照，得到位点 X（连接关闭后临时槽自动删除）；
+      3. 目标库一个事务内：TRUNCATE + 用快照 COPY 这些表，记录 table_state(表, X)；
+      4. 重新启动 run 后，主复制槽从原位点继续；这些表在 X 之前提交的变更被跳过
+         （已包含在快照数据中），X 之后的变更正常应用。其他表不受影响。
+    """
+    import psycopg2
+    import psycopg2.extensions
+    from psycopg2.extras import LogicalReplicationConnection
+
+    tables = _resolve_tables(cfg, names)
+    src = psycopg2.connect(**cfg.source)
+    src.autocommit = True
+    tgt = psycopg2.connect(**cfg.target)
+    repl = snap = None
+    try:
+        with src.cursor() as cur:
+            cur.execute('SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = %s',
+                        (cfg.slot_name,))
+            row = cur.fetchone()
+            if row is None:
+                raise ConfigError('复制槽 %s 不存在。首次部署请使用 init' % cfg.slot_name)
+            if row[0]:
+                raise ConfigError('复制槽 %s 正被进程 %s 使用，请先停止增量同步（run）再执行 resync'
+                                  % (cfg.slot_name, row[1]))
+            missing = []
+            for t in tables:
+                cur.execute('SELECT 1 FROM pg_publication_tables WHERE pubname = %s '
+                            'AND schemaname = %s AND tablename = %s', (cfg.publication, t.schema, t.name))
+                if cur.fetchone() is None:
+                    missing.append(t.qualified)
+            if missing:
+                raise ConfigError('表 %s 不在发布 %s 中，请先执行 setup' % (', '.join(missing), cfg.publication))
+
+        ensure_state_table(tgt, cfg.state_schema)
+        if read_state(tgt, cfg.state_schema, cfg.slot_name) is None:
+            raise ConfigError('目标库没有复制槽 %s 的同步位点，请先执行 init' % cfg.slot_name)
+        with src.cursor() as scur, tgt.cursor() as tcur:
+            plan = _preflight(cfg, scur, tcur, tables)
+        tgt.commit()
+
+        print('\n即将重新全量复制以下表（目标库中这些表会被 TRUNCATE 后用源库快照重新复制，其他表不受影响）:')
+        for table, _, _ in plan:
+            print('  - %s' % table.qualified)
+        if not assume_yes:
+            if input('\n输入 yes 继续: ').strip().lower() != 'yes':
+                print('已取消')
+                return 1
+
+        temp_slot = ('%s_rs_%d' % (cfg.slot_name[:40], os.getpid()))
+        repl = psycopg2.connect(connection_factory=LogicalReplicationConnection, **cfg.source)
+        rcur = repl.cursor()
+        rcur.execute('CREATE_REPLICATION_SLOT %s TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT' % temp_slot)
+        _, consistent_point, snapshot_name, _ = rcur.fetchone()
+        lsn = lsn_to_int(consistent_point)
+        log.info('已创建临时复制槽 %s，快照位点 %s', temp_slot, consistent_point)
+
+        snap = psycopg2.connect(**cfg.source)
+        snap.set_session(isolation_level=psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ, readonly=True)
+        with snap.cursor() as cur:
+            cur.execute('SET TRANSACTION SNAPSHOT %s', (snapshot_name,))
+
+        started_all = time.time()
+        with tgt.cursor() as tcur:
+            for table, cols, _ in plan:
+                started = time.time()
+                tcur.execute('TRUNCATE TABLE %s' % qname(table.schema, table.name))
+                rows = _copy_table(snap, tcur, table, cols)
+                write_table_state(tcur, cfg.state_schema, cfg.slot_name, table.qualified, lsn)
+                log.info('已复制 %-45s %12s 行  %.1fs', table.qualified,
+                         '{:,}'.format(rows) if rows is not None and rows >= 0 else '?', time.time() - started)
+        tgt.commit()
+        snap.commit()
+        log.info('resync 完成，耗时 %.1fs，这些表的起始位点为 %s', time.time() - started_all, int_to_lsn(lsn))
+
+        tgt.autocommit = True
+        with tgt.cursor() as tcur:
+            for table, _, _ in plan:
+                tcur.execute('ANALYZE %s' % qname(table.schema, table.name))
+        print('\nresync 完成。请重新启动增量同步: python -m pglsync -c %s run' % (cfg.path or 'config.json'))
+        return 0
+    except BaseException:
+        try:
+            tgt.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        # 关闭 repl 连接后，临时复制槽由 PostgreSQL 自动删除
         for conn in (snap, repl, tgt, src):
             if conn is not None and not conn.closed:
                 conn.close()

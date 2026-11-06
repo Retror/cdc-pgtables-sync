@@ -16,7 +16,7 @@ from . import pgoutput
 from .applier import Applier
 from .catalog import RelationRegistry
 from .config import ConfigError
-from .state import ensure_state_table, read_state
+from .state import ensure_state_table, read_state, read_table_states
 from .utils import int_to_lsn, pg_timestamp_to_datetime
 
 log = logging.getLogger('pglsync.stream')
@@ -112,6 +112,10 @@ class Streamer(object):
                 raise ConfigError('目标库 %s.sync_state 中没有复制槽 %s 的同步位点，请先执行 init'
                                   % (cfg.state_schema, cfg.slot_name))
             start_lsn = state[0]
+            table_lsns = read_table_states(tgt, cfg.state_schema, cfg.slot_name)
+            for name, lsn in sorted(table_lsns.items()):
+                if lsn > start_lsn:
+                    log.info('表 %s 做过 resync，位点 %s 之前的变更将被跳过', name, int_to_lsn(lsn))
             self._check_source()
 
             applier = Applier(cfg, tgt)
@@ -126,7 +130,7 @@ class Streamer(object):
             )
             log.info('开始增量同步: slot=%s publication=%s 起始位点=%s',
                      cfg.slot_name, cfg.publication, int_to_lsn(start_lsn))
-            _Session(cfg, cur, applier, registry, start_lsn).loop(self.should_stop)
+            _Session(cfg, cur, applier, registry, start_lsn, table_lsns).loop(self.should_stop)
         finally:
             _close_quietly(repl)
             _close_quietly(tgt, rollback=True)
@@ -136,11 +140,13 @@ class Streamer(object):
 class _Session(object):
     """一次复制连接的生命周期。"""
 
-    def __init__(self, cfg, cur, applier, registry, start_lsn):
+    def __init__(self, cfg, cur, applier, registry, start_lsn, table_lsns=None):
         self.cfg = cfg
         self.cur = cur
         self.applier = applier
         self.registry = registry
+        self.table_lsns = dict(table_lsns or {})   # resync 过的表 -> 快照位点
+        self.txn_lsn = 0                # 当前事务的提交位点（Begin.final_lsn）
         self.last_end = start_lsn       # 已处理（可能尚未提交到目标库）的最后一个事务 end_lsn
         self.flushed = start_lsn        # 已确认给源库的位点
         self.in_txn = False
@@ -152,7 +158,7 @@ class _Session(object):
         now = time.time()
         self.last_idle_feedback = now
         self.last_stats = now
-        self.stats = {'txns': 0, 'changes': 0, 'skipped_txns': 0}
+        self.stats = {'txns': 0, 'changes': 0, 'skipped_txns': 0, 'skipped_table_changes': 0}
 
     # ------------------------------------------------------------ 主循环
     def loop(self, should_stop):
@@ -191,6 +197,7 @@ class _Session(object):
             if self.in_txn:
                 raise pgoutput.DecodeError('收到嵌套的 BEGIN')
             self.in_txn = True
+            self.txn_lsn = m.final_lsn
             self.skip_txn = m.final_lsn < self.last_end
             if self.skip_txn:
                 self.stats['skipped_txns'] += 1
@@ -221,14 +228,27 @@ class _Session(object):
             self.stats['changes'] += n
         # Origin / Type / LogicalMessage：忽略
 
+    def _wanted(self, info):
+        """该 relation 的变更是否需要应用。"""
+        if info.target is None:
+            return False
+        table_lsn = self.table_lsns.get(info.target.qualified)
+        if table_lsn is not None and self.txn_lsn < table_lsn:
+            # 该表做过 resync，快照位点之前提交的变更已包含在复制的数据中
+            self.stats['skipped_table_changes'] += 1
+            return False
+        if info.invalid:
+            raise ConfigError(info.invalid)
+        return True
+
     def _apply(self, m):
         if type(m) is pgoutput.Truncate:
-            infos = [i for i in (self.registry.get(r) for r in m.relids) if i.target is not None]
+            infos = [i for i in (self.registry.get(r) for r in m.relids) if self._wanted(i)]
             if infos:
                 self.applier.truncate(infos, m.options)
             return len(infos)
         info = self.registry.get(m.relid)
-        if info.target is None:
+        if not self._wanted(info):
             return 0
         if type(m) is pgoutput.Insert:
             self.applier.insert(info, m.new)
@@ -275,7 +295,10 @@ class _Session(object):
         if self.last_commit_ts is not None and self.stats['txns']:
             delay = time.time() - pg_timestamp_to_datetime(self.last_commit_ts).timestamp()
             lag = ', 最近事务延迟 %.1fs' % max(0.0, delay)
-        log.info('统计: 事务 %d, 变更 %d, 跳过重放事务 %d, 目标缺行 %d, 确认位点 %s%s',
+        extra = ''
+        if self.stats['skipped_table_changes']:
+            extra = ', 跳过 resync 前变更 %d' % self.stats['skipped_table_changes']
+        log.info('统计: 事务 %d, 变更 %d, 跳过重放事务 %d, 目标缺行 %d, 确认位点 %s%s%s',
                  self.stats['txns'], self.stats['changes'], self.stats['skipped_txns'],
-                 self.applier.missing_rows, int_to_lsn(self.flushed), lag)
+                 self.applier.missing_rows, int_to_lsn(self.flushed), lag, extra)
         self.stats = dict.fromkeys(self.stats, 0)

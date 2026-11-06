@@ -22,8 +22,9 @@
 - [5. 同步程序的运行方式](#5-同步程序的运行方式)
 - [6. 测试写入脚本的使用方式](#6-测试写入脚本的使用方式)
 - [7. 端到端测试流程](#7-端到端测试流程)
-- [8. 常见问题排查](#8-常见问题排查)
-- [9. 生产环境切换要点](#9-生产环境切换要点)
+- [8. 新增同步表与表结构变更](#8-新增同步表与表结构变更)
+- [9. 常见问题排查](#9-常见问题排查)
+- [10. 生产环境切换要点](#10-生产环境切换要点)
 
 ---
 
@@ -328,6 +329,7 @@ C=config.test.json
 | `init` | 创建复制槽，并全量复制到目标库（会 TRUNCATE 目标表） | 目标库为空或数据不可信 |
 | `init --no-copy` | 创建复制槽，**用快照核对两边数据，以目标库现有数据为起点** | 目标库已有一致数据 |
 | `run` | 常驻进程，执行增量同步 | 初始化完成后 |
+| `resync -t 表` | 只把指定的表用源库快照重新复制一遍，其他表不受影响（需要先停止 `run`） | 新增同步表、表结构变更、单表数据不一致（见第 8 节） |
 | `status` | 查看复制槽是否活跃、WAL 积压、同步位点 | 日常监控 |
 | `reconcile` | 按行数和整行哈希核对两边数据 | 定期核对、排查问题 |
 | `drop` | 删除复制槽、发布和同步位点 | 停用同步时，**必须执行** |
@@ -663,7 +665,256 @@ python3 -m pglsync -c $C drop -y          # 必须执行，否则 131 会持续�
 
 ---
 
-## 8. 常见问题排查
+## 8. 新增同步表与表结构变更
+
+### 8.1 先记住三条规则
+
+1. **pglsync 不同步 DDL（表结构变更）。** 新建表、加列、改类型等操作，都必须在源库和目标库**分别执行**，两边保持一致。
+2. **结构不匹配不会丢数据。** 两边结构对不上时，`run` 会报错并自动重试，复制槽继续保留 WAL。把结构改一致后，程序会从断点自动继续。所以就算操作顺序错了也能补救，只要别让 WAL 积压太久。
+3. **万能补救手段是 `resync -t 表名`。** 它会用源库当前的快照把这张表重新复制一遍，并且让增量同步跳过这张表在快照之前的旧变更。**不管做了什么结构变更，只要执行一次 `resync`，这张表就一定是一致的。** 代价是整表复制：大表比较耗时，复制期间目标库的这张表会被锁住。
+
+### 8.2 `resync` 命令说明
+
+```bash
+python3 -m pglsync -c $C resync -t public.new_table                       # 一张表
+python3 -m pglsync -c $C resync -t public.a -t public.b                   # 多张表共用同一个快照
+python3 -m pglsync -c $C resync -t public.tcrealtime -y                   # 不交互确认
+```
+
+执行过程：
+
+1. 检查：主复制槽存在且**没有进程在使用**（`run` 已停止）；表在配置文件的 `tables` 中；表已加入发布；目标表的结构满足要求；
+2. 在源库创建一个**临时复制槽**，得到一致性快照和对应的位点 X（命令结束后临时槽自动删除）；
+3. 在目标库**一个事务里**：TRUNCATE 这些表 → 用快照复制数据 → 在 `pglsync.table_state` 中记录“这些表从位点 X 开始”；
+4. 重新启动 `run` 后，主复制槽从原来的位点继续读取：
+   - 这些表在 X **之前**提交的变更会被跳过，因为它们已经包含在复制的数据里了；
+   - X **之后**的变更正常应用；
+   - 其他表完全不受影响。
+
+注意事项：
+
+- `resync` 期间**源库可以照常写入**；
+- 停止 `run` 期间，其他表的同步会暂停，源库会保留 WAL。`run` 重新启动后会自动追上；
+- 临时复制槽需要占用一个空闲的 `max_replication_slots` 和 `max_wal_senders` 名额；
+- 创建快照时，需要等源库上正在执行的事务结束。如果源库有长时间未提交的事务，`resync` 会一直等到它结束。
+
+`run` 启动时会打印哪些表做过 resync：
+
+```
+INFO 表 public.new_table 做过 resync，位点 4/3A000028 之前的变更将被跳过
+```
+
+### 8.3 新增一张需要同步的表
+
+以新增 `public.new_table` 为例：
+
+```bash
+cd /opt/cdc-pgtables-sync && C=config.test.json
+```
+
+**① 确认源表有主键**
+
+没有主键的表，加入发布后**源库对它执行 UPDATE/DELETE 会直接报错**。可以这样查：
+
+```sql
+-- 在 131 上执行，查不到结果说明没有主键
+SELECT conname FROM pg_constraint WHERE conrelid = 'public.new_table'::regclass AND contype = 'p';
+```
+
+**② 在目标库（132）建表**，结构要和源库完全一致：
+
+```bash
+pg_dump -h 192.168.234.131 -U postgres -s -t public.new_table typhoon > new_table.sql
+# 打开 new_table.sql，删掉其中的触发器（如果有）
+psql -h 192.168.234.132 -U postgres -d typhoon -f new_table.sql
+```
+
+如果是 TimescaleDB 超表，还要在 132 上执行 `SELECT create_hypertable('public.new_table', '时间列');`。
+
+**③ 把表加入配置文件**（`config.test.json` 的 `tables`）：
+
+```jsonc
+"public.new_table": {}                                                        // 普通表
+"public.new_hyper": {"pk": ["id", "datatime"], "time_column": "datatime"}     // 超表
+```
+
+**④ 停止增量同步**
+
+```bash
+sudo systemctl stop pglsync-test        # 前台运行的话，按 Ctrl+C
+```
+
+**⑤ 把新表加入发布**
+
+```bash
+python3 -m pglsync -c $C check     # 确认没有“问题”
+python3 -m pglsync -c $C setup     # 输出中会有：ALTER PUBLICATION ... ADD TABLE "public"."new_table"
+```
+
+发布模式为 `all`（FOR ALL TABLES）时，所有表本来就在发布中，`setup` 会显示“发布已就绪”。
+
+**⑥ 复制新表的数据**
+
+```bash
+python3 -m pglsync -c $C resync -t public.new_table
+```
+
+**⑦ 重新启动增量同步**
+
+```bash
+sudo systemctl start pglsync-test
+```
+
+**⑧ 核对**
+
+```bash
+python3 -m pglsync -c $C reconcile -t public.new_table
+```
+
+> [!NOTE]
+> 为什么要停止 `run`？一是 `run` 只在启动时读取配置文件，改了配置必须重启才会生效；二是 `resync` 复制数据期间，不能让 `run` 同时写这张表。
+>
+> 如果 132 上的新表已经有和 131 一致的数据，也不想重新复制，可以用 `init --no-copy --recreate-slot` 代替第 ⑥ 步。但它会核对**所有**表，表多、数据量大时比较慢。
+
+### 8.4 停止同步某张表
+
+```bash
+sudo systemctl stop pglsync-test
+# 1. 从 config.test.json 的 tables 中删除这张表
+# 2. 从发布中移除（发布模式为 all 时跳过这一步）
+psql -h 192.168.234.131 -U postgres -d typhoon -c 'ALTER PUBLICATION pglsync_test_pub DROP TABLE public.old_table;'
+sudo systemctl start pglsync-test
+```
+
+目标库里这张表的数据会保持原样，不会被删除。
+
+### 8.5 修改表结构（字段）
+
+先看下表确定处理方式，再按对应小节操作：
+
+| 变更类型 | 需要停止同步？ | 操作顺序 | 需要 resync？ | 详见 |
+|---|---|---|---|---|
+| 新增列：可为空，或默认值是常量 | 否 | **先目标库，后源库** | 否 | 8.5.1 |
+| 新增列：默认值是 `now()`、`random()`、序列等易变表达式 | 否 | 先目标库，后源库 | **是**（或者在源库用 UPDATE 回填） | 8.5.1 |
+| 删除列 | 否 | **先源库，同步追上后再改目标库** | 否 | 8.5.2 |
+| 扩大类型：`varchar` 加长、`int` → `bigint`、`numeric` 加大精度 | 否 | **先目标库，后源库** | 否 | 8.5.3 |
+| 缩小类型或改成不兼容的类型 | 是 | 通用流程 | 是 | 8.5.4 |
+| 重命名列 | 是 | 通用流程 | 是 | 8.5.4 |
+| 修改主键 | 是 | 通用流程，同时修改配置中的 `pk` | 是 | 8.5.4 |
+| 重命名表 | 是 | 通用流程，同时修改配置中的表名 | 是 | 8.5.4 |
+| 增加或删除普通索引 | 否 | 两边各自执行，互不影响 | 否 | — |
+| 增加 NOT NULL 或 CHECK 约束 | 否 | 先源库（确认现有数据满足约束），后目标库 | 否 | — |
+
+> [!TIP]
+> 拿不准的时候，就用 **8.5.4 的通用流程**，任何变更都适用，代价只是这张表要整表复制一次。
+
+#### 8.5.1 新增列
+
+```sql
+-- ① 先在目标库 132 执行
+ALTER TABLE public.tcrealtime ADD COLUMN remark varchar(64);
+-- ② 再在源库 131 执行（定义必须完全相同）
+ALTER TABLE public.tcrealtime ADD COLUMN remark varchar(64);
+```
+
+不需要停止同步，也不需要 resync。
+
+**为什么是这个顺序：** 目标库先多出一列时，源库发来的旧格式数据里没有这一列，写入目标库时这一列取默认值，不会出错。源库加列后，新数据带上了这一列，目标库已经准备好了。
+
+**顺序反了怎么办：** 日志会不断报 `column "remark" of relation "tcrealtime" does not exist` 并重试。在目标库补上这一列后，程序会自动恢复，不丢数据。
+
+**默认值是易变表达式时**（比如 `ADD COLUMN created_at timestamptz DEFAULT now()`）：源库给已有行填的值是在源库上算出来的，这个过程**不会产生逐行变更，不会同步过去**；目标库会自己算出另一个值，两边就不一致了。处理方法二选一：
+
+- 加列后执行 `resync -t public.tcrealtime`（需要先停止 `run`）；
+- 或者加列时先不带默认值，然后在源库执行 `UPDATE ... SET 新列 = ...` 回填。UPDATE 会正常同步过去。
+
+TimescaleDB 超表的 `ALTER TABLE` 会自动应用到所有 chunk，不需要单独处理。
+
+#### 8.5.2 删除列
+
+```sql
+-- ① 先在源库 131 执行，并记下此时的 WAL 位置
+ALTER TABLE public.tcrealtime DROP COLUMN remark;
+SELECT pg_current_wal_lsn();          -- 例如 4/3B0012F8
+```
+
+```bash
+# ② 等增量同步追上：“已确认位点”大于等于上一步记下的位置
+python3 -m pglsync -c $C status
+```
+
+```sql
+-- ③ 再在目标库 132 执行
+ALTER TABLE public.tcrealtime DROP COLUMN remark;
+```
+
+**为什么要等同步追上：** 删列之前产生、还没同步过去的变更里仍然带着这一列。目标库必须等这些变更都应用完，才能删掉这一列。
+
+**如果目标库这一列是 `NOT NULL` 且没有默认值：** 源库删列之后，新数据不再带这一列，插入目标库会失败。所以第 ① 步之前，先在 132 上执行 `ALTER TABLE public.tcrealtime ALTER COLUMN remark DROP NOT NULL;`。
+
+**目标库删早了怎么办：** 日志会报 `column "remark" does not exist`。在目标库把这一列加回来（定义相同），程序会自动恢复，然后再按上面的步骤操作。
+
+#### 8.5.3 扩大字段类型
+
+```sql
+-- ① 先在目标库 132 执行
+ALTER TABLE public.tcrealtime ALTER COLUMN tcname TYPE varchar(128);
+-- ② 再在源库 131 执行
+ALTER TABLE public.tcrealtime ALTER COLUMN tcname TYPE varchar(128);
+```
+
+目标库先放宽后，源库发来的旧值和新值都能写进去。如果顺序反了，源库写入的超长值会让目标库报 `value too long` 并重试，补做第 ① 步后程序会自动恢复。
+
+#### 8.5.4 通用流程（任何结构变更都适用）
+
+适用于重命名列、缩小或改变类型、修改主键、重命名表，以及任何拿不准的情况。以“把 `tcrealtime.tc_level` 重命名为 `tc_grade`”为例：
+
+```bash
+cd /opt/cdc-pgtables-sync && C=config.test.json
+
+# ① 停止增量同步
+sudo systemctl stop pglsync-test
+```
+
+```sql
+-- ② 在目标库 132 和源库 131 上执行相同的 DDL（先后顺序无所谓）
+ALTER TABLE public.tcrealtime RENAME COLUMN tc_level TO tc_grade;
+```
+
+```bash
+# ③ 如果改了主键或表名，同步修改 config.test.json（tables 里的 pk 或表名），然后执行：
+python3 -m pglsync -c $C check
+python3 -m pglsync -c $C setup
+
+# ④ 用变更后的结构重新复制这张表
+python3 -m pglsync -c $C resync -t public.tcrealtime
+
+# ⑤ 重新启动增量同步
+sudo systemctl start pglsync-test
+
+# ⑥ 核对
+python3 -m pglsync -c $C reconcile -t public.tcrealtime
+```
+
+**为什么这样是安全的：** `resync` 把这张表的起点设在 DDL **之后**的快照位点。`run` 重新启动后，这张表在 DDL 之前产生的、按旧结构编码的变更会被全部跳过，所以新旧结构不会冲突。其他表照常从断点继续。
+
+**修改主键时额外注意：**
+
+- 目标库要同步修改主键约束，否则 `resync` 的检查会报“没有与主键完全一致的唯一约束”；
+- 配置文件里的 `pk` 要改成新的主键列；
+- 如果源表的主键被删掉、又没有新建主键，源库对它的 UPDATE/DELETE 会直接报错。一定要在同一个维护窗口里把新主键建好。
+
+### 8.6 新增表或修改表结构的检查清单
+
+- [ ] 两边的 DDL 完全相同：列名、类型、默认值、主键都一致；
+- [ ] 新表有主键，并且已经加入配置文件和发布（`setup`）；
+- [ ] 按 8.5 节的表格确定了操作顺序，以及是否需要 `resync`；
+- [ ] 操作完成后，`run` 的日志里没有持续的报错；
+- [ ] `reconcile -t 表名` 显示一致。
+
+---
+
+## 9. 常见问题排查
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -675,7 +926,10 @@ python3 -m pglsync -c $C drop -y          # 必须执行，否则 131 会持续�
 | `复制槽正被进程 xxx 占用` | 有另一个 `run` 进程在运行 | 只保留一个同步进程 |
 | `column c.schema_name does not exist` | 旧版代码依赖 TimescaleDB 内部表结构 | 已在提交 `6aeb368` 修复，执行 `git pull` 后重启 |
 | `init --no-copy` 报告不一致 | 上次同步之后源库又有写入，或者历史数据本来就不一致 | `init --no-copy --on-mismatch copy` |
-| 日志报列数不匹配，或者 `column ... does not exist` | 源表加了列，目标表还没加 | 在目标库补上列，程序自动恢复，不丢数据。以后**先改目标库，再改源库** |
+| 日志报列数不匹配，或者 `column ... does not exist` | 两边表结构不一致（源库改了表，目标库没改，或者顺序反了） | 按第 8.5 节处理：补齐目标库结构后程序自动恢复，不丢数据；或者用通用流程加 `resync` |
+| 进程退出，提示“复制标识不包含主键列” | 修改了主键，但配置文件里的 `pk` 没改；或者源表的主键被删了 | 按第 8.5.4 节的通用流程修改配置并执行 `resync` |
+| `resync` 提示“正被进程 xxx 使用” | `run` 还在运行 | 先停止 `run` |
+| `resync` 提示“不在发布中” | 新表还没加入发布 | 先执行 `setup` |
 | 源库业务 UPDATE/DELETE 报 `cannot update table ... because it does not have a replica identity` | 发布范围内的表没有主键 | 给表加主键，或者执行 `ALTER TABLE ... REPLICA IDENTITY FULL` |
 | 源库 `pg_wal` 目录持续增长 | 同步进程停止，复制槽一直保留 WAL | 尽快恢复 `run`；不再使用时执行 `drop` |
 | `status` 显示 `wal_status = lost` | 积压超过 `max_slot_wal_keep_size`，复制槽失效 | `init --recreate-slot`（或者加上 `--no-copy --on-mismatch copy`） |
@@ -699,7 +953,7 @@ FROM pg_replication_slots;
 
 ---
 
-## 9. 生产环境切换要点
+## 10. 生产环境切换要点
 
 测试通过后，参考 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) 切换生产。要点如下：
 

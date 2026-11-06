@@ -308,8 +308,10 @@ class RegistryTest(unittest.TestCase):
 
     def test_pk_must_be_in_replica_identity(self):
         reg = self._registry({})
-        with self.assertRaises(ConfigError):
-            reg.register(pgoutput.decode(msg_relation(13, 'public', 'h', [('id', True), ('ts', False)])))
+        info = reg.register(pgoutput.decode(msg_relation(13, 'public', 'h', [('id', True), ('ts', False)])))
+        # 注册时不报错（可能是将被跳过的旧 relation），应用变更时才报错
+        self.assertIsNotNone(info.invalid)
+        self.assertIn('复制标识', info.invalid)
 
 
 class FakeReplCursor(object):
@@ -377,6 +379,38 @@ class SessionTest(unittest.TestCase):
         s.last_idle_feedback = 0
         s._idle_feedback(now=1e9)
         self.assertEqual(cur.feedback, [500])
+
+    def test_resync_table_skips_changes_before_its_lsn(self):
+        s, h, cur = self._session(start_lsn=100)
+        s.table_lsns = {'public.t': 300}
+        s.handle(msg_relation(1, 'public', 't', [('id', True), ('name', False), ('big', False)]))
+        s.handle(msg_relation(3, 'public', 'h', [('id', True), ('ts', True), ('v', False)]))
+        # commit_lsn 200 < 300：public.t 的变更跳过，其他表照常应用
+        s.handle(msg_begin(200))
+        s.handle(msg_insert(1, '1', 'old', None))
+        s.handle(msg_insert(3, '7', '2026-11-01 00:00:00+00', 'x'))
+        s.handle(msg_commit(200, 210))
+        # commit_lsn 400 >= 300：public.t 的变更正常应用
+        s.handle(msg_begin(400))
+        s.handle(msg_insert(1, '2', 'new', None))
+        s.handle(msg_commit(400, 410))
+        s.flush()
+        tables = [sql.split(' ')[2] for sql, _ in h.batches]
+        self.assertEqual(tables, ['"public"."h"', '"public"."t"'])
+        self.assertEqual(h.batches[1][1], [('2', 'new', None)])
+        self.assertEqual(s.stats['skipped_table_changes'], 1)
+
+    def test_invalid_relation_skipped_before_resync_lsn_but_fails_after(self):
+        s, h, cur = self._session(start_lsn=0)
+        s.table_lsns = {'public.h': 300}
+        # 旧 relation：主键列 ts 不在复制标识中（例如表结构变更前），校验失败
+        s.handle(msg_relation(3, 'public', 'h', [('id', True), ('ts', False), ('v', False)]))
+        s.handle(msg_begin(100))
+        s.handle(msg_insert(3, '1', '2026-11-01 00:00:00+00', 'x'))   # 被跳过，不报错
+        s.handle(msg_commit(100, 110))
+        s.handle(msg_begin(500))
+        with self.assertRaises(ConfigError):
+            s.handle(msg_insert(3, '2', '2026-11-01 00:00:00+00', 'y'))
 
 
 class VerifySnapshotTest(unittest.TestCase):
