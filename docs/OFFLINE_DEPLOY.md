@@ -21,6 +21,8 @@
 | B. 改用 Java 版（`pglsync.jar`） | 目标机器有 JRE 8+，或者可以离线放一个 JRE | 很低 |
 | C. 把程序移植到 Python 2.7 | 目标机器**完全不允许**放任何新的运行环境 | 不推荐，需要的话可以再做 |
 
+> 目标机器装有 Docker 的话，也可以直接用 Docker 部署，镜像里自带 Python 3 和所有依赖，见 [DOCKER_DEPLOY.md](DOCKER_DEPLOY.md)。
+
 ---
 
 ## 1. 先查清目标机器的情况

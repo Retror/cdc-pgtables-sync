@@ -1,0 +1,67 @@
+# =============================================================================
+# pglsync Docker 部署（Python 版）
+#
+# 目录约定（与本文件放在同一目录）：
+#   docker-compose.yml
+#   config.json        pglsync 配置（logging.file 请写 /app/logs/pglsync.log）
+#   pglsync.env        数据库密码等环境变量（chmod 600）
+#   logs/              日志目录（需要 chown 10001:10001 logs）
+#
+# 常用命令（docker compose v2；旧版 docker-compose v1 把空格换成横杠）：
+#   docker compose run --rm pglsync check            # 一次性命令
+#   docker compose run --rm pglsync init --no-copy   # 需要确认的命令会交互，或加 -y
+#   docker compose up -d pglsync                     # 启动增量同步
+#   docker compose logs -f pglsync
+#   docker compose --profile test up -d load-writer  # 测试：定时写入
+# =============================================================================
+services:
+  pglsync:
+    image: pglsync:1.0.0
+    container_name: pglsync
+    # 使用宿主机网络：容器内 127.0.0.1 就是宿主机，连接本机源库时与直接部署完全一致，
+    # 也不需要为容器网段额外配置 pg_hba.conf
+    network_mode: host
+    restart: unless-stopped
+    # 收到 SIGTERM 后处理完当前事务再退出，给足时间
+    stop_grace_period: 120s
+    env_file:
+      - ./pglsync.env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./logs:/app/logs
+    command: ["run"]
+    healthcheck:
+      # 复制槽没有被连接、WAL 失效或没有同步位点时 status 返回非 0
+      test: ["CMD", "python", "-m", "pglsync", "-c", "/app/config/config.json", "status"]
+      interval: 2m
+      timeout: 30s
+      retries: 3
+      start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # 测试数据写入（只在测试环境使用：docker compose --profile test up -d load-writer）
+  load-writer:
+    image: pglsync:1.0.0
+    container_name: pglsync-load-writer
+    profiles: ["test"]
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ./pglsync.env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+    entrypoint: ["python", "tools/load_writer.py", "-c", "/app/config/config.json"]
+    command: []
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
