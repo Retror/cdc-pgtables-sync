@@ -87,6 +87,80 @@ docker save pglsync:1.0.0 | gzip > pglsync-1.0.0-amd64.tar.gz
 - 以非 root 用户（uid 10001）运行；
 - 旧脚本（`cdc_sync.py` 等，里面有明文密码）、`config.json`、`*.env` 已在 `.dockerignore` 中排除，**不会打进镜像**。
 
+### 3.3 构建时拉不到基础镜像
+
+典型报错：
+
+```
+ERROR: failed to solve: python:3.11-slim: failed to resolve source metadata for
+docker.io/library/python:3.11-slim: docker.io/library/python:3.11-slim: not found
+```
+
+**它的意思是构建过程没能从 Docker Hub 取到基础镜像，并不是镜像真的不存在。** 先在构建机上执行下面两条命令定位原因：
+
+```bash
+docker pull python:3.11-slim          # 1. docker 守护进程能不能拉到
+docker buildx ls                      # 2. 当前使用的是哪个 builder（带 * 的那一行）
+```
+
+| `docker pull` 的结果 | 原因 | 处理 |
+|---|---|---|
+| **成功** | buildx 当前使用的是独立的 builder（DRIVER 列为 `docker-container`）。它运行在单独的容器里，**不会使用** `/etc/docker/daemon.json` 中配置的镜像加速，也看不到本地已有的镜像 | ① 改用默认 builder：`docker buildx use default`；② 或者直接用 `docker build`（新版脚本在本机架构下会自动这样做）；③ 必须跨架构构建时，给 builder 配置镜像加速，见下文 |
+| **失败**（超时、`not found`、`unauthorized`） | 构建机访问不了 Docker Hub（国内网络常见），或者配置的加速地址已经失效 | 配置可用的镜像加速，或者通过 `BASE_IMAGE` 改用内网 Harbor / 国内镜像站，见下文 |
+
+**处理方法 1：配置 Docker 镜像加速**（对 `docker pull` / `docker build` 生效）
+
+```bash
+sudo tee /etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": ["https://<你的镜像加速地址>"]
+}
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart docker
+docker info | grep -A3 "Registry Mirrors"       # 确认已生效
+```
+
+加速地址可以用公司内网的 Harbor 或 Nexus 代理，也可以用云厂商（如阿里云容器镜像服务）给账号分配的专属加速地址。公共加速站的可用性经常变化，失效时请换一个。
+
+**处理方法 2：直接指定基础镜像地址**（不依赖加速配置）
+
+新版脚本和 Dockerfile 支持用环境变量或构建参数替换基础镜像，同时也可以替换 pip / Maven 源：
+
+```bash
+# Python 版：基础镜像从内网 Harbor 或国内镜像站拉取，pip 使用清华源
+BASE_IMAGE=harbor.example.com/library/python:3.11-slim \
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+bash deploy/docker/build_and_save.sh python
+
+# Java 版
+BUILD_IMAGE=harbor.example.com/library/maven:3.9-eclipse-temurin-8 \
+RUNTIME_IMAGE=harbor.example.com/library/eclipse-temurin:8-jre \
+MAVEN_MIRROR_URL=https://maven.aliyun.com/repository/public \
+bash deploy/docker/build_and_save.sh java
+```
+
+手动构建时写法相同：`docker build --build-arg BASE_IMAGE=... --build-arg PIP_INDEX_URL=... -t pglsync:1.0.0 .`
+
+**处理方法 3：别处拉好镜像，导入构建机**
+
+能访问 Docker Hub 的任意机器上执行 `docker pull python:3.11-slim && docker save python:3.11-slim -o python-3.11-slim.tar`，拷到构建机上 `docker load -i python-3.11-slim.tar`。之后在本机架构下用 `docker build` 构建，会直接使用这个本地镜像。
+
+**跨架构构建（buildx）时给 builder 配置镜像加速：**
+
+```bash
+cat > buildkitd.toml <<'EOF'
+[registry."docker.io"]
+  mirrors = ["<你的镜像加速地址，不带 https://>"]
+EOF
+docker buildx create --name pglsync-builder --driver docker-container --config buildkitd.toml --use
+docker buildx inspect --bootstrap
+```
+
+新版 [build_and_save.sh](../deploy/docker/build_and_save.sh) 的改进：
+
+- 先用 `docker pull` 拉取基础镜像，拉不到时直接给出上面这些处理建议；
+- 目标架构与本机相同时，用普通的 `docker build`，会使用 daemon 的加速配置和本地镜像；只有跨架构时才用 buildx。
+
 ---
 
 ## 4. 在目标机器上导入镜像并准备目录
@@ -290,6 +364,7 @@ docker version && docker compose version
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 构建时报 `failed to resolve source metadata for docker.io/library/python:3.11-slim ... not found` | 构建机访问不了 Docker Hub，或者 buildx 的独立 builder 没有使用镜像加速 | 见 [第 3.3 节](#33-构建时拉不到基础镜像) |
 | `exec format error` | 镜像架构与目标机器不一致 | 按 `uname -m` 重新构建：`build_and_save.sh python linux/arm64` |
 | `connection refused` 连接 127.0.0.1 | 没有使用宿主机网络 | 确认 compose 中有 `network_mode: host`，`docker run` 时加 `--network host` |
 | `no pg_hba.conf entry for host "172.17.x.x"` | 使用了 bridge 网络 | 改用宿主机网络，或者在 `pg_hba.conf` 中放行 Docker 网段 |
