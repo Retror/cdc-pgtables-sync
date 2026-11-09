@@ -1,0 +1,16 @@
+# 不要把密钥、旧脚本、构建产物打进镜像
+.git
+.gitignore
+.gitattributes
+dist/
+logs/
+**/__pycache__/
+*.pyc
+*.log
+*.env
+config.json
+cdc_sync*.py
+compare_tables.py
+pglsync-java/
+deploy/
+docs/

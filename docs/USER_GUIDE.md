@@ -232,7 +232,7 @@ git pull
 
 ### 3.2 安装依赖
 
-> 目标机器**没有外网**，或者只有 **Python 2.7** 时，请按 [OFFLINE_DEPLOY.md](OFFLINE_DEPLOY.md) 制作离线安装包，与 2.7 并存安装 Python 3。
+> 目标机器**没有外网**，或者只有 **Python 2.7** 时，请按 [OFFLINE_DEPLOY.md](OFFLINE_DEPLOY.md) 制作离线安装包，与 2.7 并存安装 Python 3；也可以用 Docker 部署，见 [DOCKER_DEPLOY.md](DOCKER_DEPLOY.md)。
 
 ```bash
 pip3 install -r requirements.txt
