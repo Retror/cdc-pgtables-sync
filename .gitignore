@@ -4,4 +4,5 @@ config.json
 *.env
 *.log
 logs/
+dist/
 .cdc_last_id
