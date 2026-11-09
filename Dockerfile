@@ -1,8 +1,15 @@
 # pglsync（Python 版）镜像
 #   构建: docker build -t pglsync:1.0.0 .
 #   ARM:  docker buildx build --platform linux/arm64 -t pglsync:1.0.0 --load .
-FROM python:3.11-slim
+#
+# 无法访问 Docker Hub / PyPI 时，可通过构建参数替换为内网仓库或国内镜像：
+#   docker build -t pglsync:1.0.0 \
+#     --build-arg BASE_IMAGE=harbor.example.com/library/python:3.11-slim \
+#     --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple .
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE}
 
+ARG PIP_INDEX_URL=
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
@@ -11,7 +18,11 @@ WORKDIR /app
 
 # 依赖单独一层，代码变更时不必重新安装
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN if [ -n "$PIP_INDEX_URL" ]; then \
+        pip install --no-cache-dir -i "$PIP_INDEX_URL" -r requirements.txt; \
+    else \
+        pip install --no-cache-dir -r requirements.txt; \
+    fi
 
 COPY pglsync ./pglsync
 COPY tools ./tools
