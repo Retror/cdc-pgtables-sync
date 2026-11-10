@@ -931,6 +931,7 @@ python3 -m pglsync -c $C reconcile -t public.tcrealtime
 | `复制槽正被进程 xxx 占用` | 有另一个 `run` 进程在运行 | 只保留一个同步进程 |
 | `column c.schema_name does not exist` | 旧版代码依赖 TimescaleDB 内部表结构 | 已在提交 `6aeb368` 修复，执行 `git pull` 后重启 |
 | `init --no-copy` 报告不一致 | 上次同步之后源库又有写入，或者历史数据本来就不一致 | `init --no-copy --on-mismatch copy` |
+| `check` 提示 `_timescaledb_internal.bgw_policy_chunk_stats`（或其他 `_timescaledb_internal` 下非 `_hyper_` 开头的表）缺少复制标识 | PG15+ 的发布用 `TABLES IN SCHEMA _timescaledb_internal` 来覆盖超表的 chunk，这个 schema 里还有 TimescaleDB 自己的内部表，它们也会被纳入发布。这类表没有主键，被扩展以普通 SQL 删改时（比如外键级联删除）会报错 | 执行 `setup --fix-replica-identity`：表上有合适的唯一索引时，用 `REPLICA IDENTITY USING INDEX` 指定它作为复制标识，否则用 `FULL`。这类表只有几行，开销可以忽略。**升级 TimescaleDB 之后再执行一次 `check`**（升级可能重建内部表） |
 | 日志报列数不匹配，或者 `column ... does not exist` | 两边表结构不一致（源库改了表，目标库没改，或者顺序反了） | 按第 8.5 节处理：补齐目标库结构后程序自动恢复，不丢数据；或者用通用流程加 `resync` |
 | 进程退出，提示“复制标识不包含主键列” | 修改了主键，但配置文件里的 `pk` 没改；或者源表的主键被删了 | 按第 8.5.4 节的通用流程修改配置并执行 `resync` |
 | `resync` 提示“正被进程 xxx 使用” | `run` 还在运行 | 先停止 `run` |
