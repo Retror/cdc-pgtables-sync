@@ -39,12 +39,23 @@ public class SetupService {
         final String schema;
         final String name;
         final String ident;
+        /** 可用作复制标识的唯一索引名，没有则为 null。 */
+        final String uniqueIndex;
 
-        BadTable(String schema, String name, String ident) {
+        BadTable(String schema, String name, String ident, String uniqueIndex) {
             this.schema = schema;
             this.name = name;
             this.ident = ident;
+            this.uniqueIndex = uniqueIndex;
         }
+    }
+
+    /** 修复语句：有合适的唯一索引时用它作为复制标识（WAL 开销与主键相同），否则 FULL。 */
+    static String riFixSql(String schema, String name, String uniqueIndex) {
+        if (uniqueIndex != null) {
+            return "ALTER TABLE " + Sql.qname(schema, name) + " REPLICA IDENTITY USING INDEX " + Sql.qi(uniqueIndex);
+        }
+        return "ALTER TABLE " + Sql.qname(schema, name) + " REPLICA IDENTITY FULL";
     }
 
     private List<BadTable> findBadReplicaIdentity(Connection c, String mode, List<String> chunkSchemas)
@@ -59,10 +70,17 @@ public class SetupService {
         } else {
             where = "(n.nspname || '.' || c.relname) = ANY(?)";
         }
-        // compress_hyper_* 是 TimescaleDB 内部压缩表，只被扩展内部写入，不经过复制标识检查
+        // compress_hyper_* 是 TimescaleDB 内部压缩表，只被扩展内部写入，不经过复制标识检查。
+        // 可用作复制标识的索引：唯一、非部分、非表达式、立即检查、有效，且所有列 NOT NULL。
         String sql = "SELECT n.nspname, c.relname, c.relreplident::text, "
                 + "EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary), "
-                + "EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident) "
+                + "EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident), "
+                + "(SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+                + "  WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL "
+                + "    AND i.indexprs IS NULL AND i.indimmediate AND i.indisvalid "
+                + "    AND NOT EXISTS (SELECT 1 FROM pg_attribute a "
+                + "                     WHERE a.attrelid = c.oid AND a.attnum = ANY (i.indkey) AND NOT a.attnotnull) "
+                + "  ORDER BY i.indnatts, ic.relname LIMIT 1) "
                 + "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
                 + "WHERE c.relkind IN ('r', 'p') AND c.relpersistence = 'p' "
                 + "AND left(c.relname, 15) <> 'compress_hyper_' AND " + where + " ORDER BY 1, 2";
@@ -80,7 +98,7 @@ public class SetupService {
                     boolean hasPk = rs.getBoolean(4);
                     boolean hasRiIdx = rs.getBoolean(5);
                     if ("n".equals(ident) || ("d".equals(ident) && !hasPk) || ("i".equals(ident) && !hasRiIdx)) {
-                        bad.add(new BadTable(rs.getString(1), rs.getString(2), ident));
+                        bad.add(new BadTable(rs.getString(1), rs.getString(2), ident, rs.getString(6)));
                     }
                 }
             }
@@ -104,17 +122,22 @@ public class SetupService {
     private void fixReplicaIdentity(Connection c, List<BadTable> bad, List<String> chunkSchemas) throws SQLException {
         Set<String> roots = new HashSet<>();
         for (BadTable b : bad) {
-            if (chunkSchemas.contains(b.schema)) {
-                String[] root = hypertableRoot(c, b.schema, b.name);
-                if (root != null && roots.add(Sql.qname(root[0], root[1]))) {
+            String[] root = chunkSchemas.contains(b.schema) ? hypertableRoot(c, b.schema, b.name) : null;
+            if (root != null) {
+                if (roots.add(Sql.qname(root[0], root[1]))) {
                     Console.println("  ALTER TABLE " + Sql.qname(root[0], root[1]) + " REPLICA IDENTITY FULL  (超表)");
                     Db.execute(c, "ALTER TABLE " + Sql.qname(root[0], root[1]) + " REPLICA IDENTITY FULL");
                 }
+                // chunk 统一用 FULL，与超表保持一致
+                String stmt = riFixSql(b.schema, b.name, null);
+                Console.println("  " + stmt);
+                Db.execute(c, stmt);
+            } else {
+                // 普通表 / TimescaleDB 内部目录表：有合适唯一索引时用索引
+                String stmt = riFixSql(b.schema, b.name, b.uniqueIndex);
+                Console.println("  " + stmt);
+                Db.execute(c, stmt);
             }
-        }
-        for (BadTable b : bad) {
-            Console.println("  ALTER TABLE " + Sql.qname(b.schema, b.name) + " REPLICA IDENTITY FULL");
-            Db.execute(c, "ALTER TABLE " + Sql.qname(b.schema, b.name) + " REPLICA IDENTITY FULL");
         }
     }
 
@@ -222,10 +245,13 @@ public class SetupService {
             if (!bad.isEmpty()) {
                 Console.println("\n以下表没有可用的复制标识（加入发布后，源库对它们的 UPDATE/DELETE 会报错！）:");
                 for (BadTable b : bad) {
-                    Console.println("  - " + Sql.qname(b.schema, b.name) + " (replident=" + b.ident + ")");
+                    String note = chunkSchemas.contains(b.schema) && !b.name.startsWith("_hyper_")
+                            ? "  <- TimescaleDB 内部目录表（因 TABLES IN SCHEMA " + b.schema + " 被纳入发布）" : "";
+                    Console.println("  - " + Sql.qname(b.schema, b.name) + " (replident=" + b.ident + ")" + note);
+                    Console.println("      建议: " + riFixSql(b.schema, b.name, b.uniqueIndex) + ";");
                 }
                 if (apply && fixRi) {
-                    Console.println("\n设置 REPLICA IDENTITY FULL（更推荐为这些表添加主键）:");
+                    Console.println("\n修复复制标识（有合适唯一索引的表使用该索引，否则 REPLICA IDENTITY FULL）:");
                     fixReplicaIdentity(c, bad, chunkSchemas);
                     bad = findBadReplicaIdentity(c, mode, chunkSchemas);
                     if (!bad.isEmpty()) {
