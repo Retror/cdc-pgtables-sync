@@ -85,7 +85,8 @@ def effective_mode(cfg, ver, chunk_schemas):
 
 
 def find_bad_replica_identity(cur, cfg, mode, chunk_schemas):
-    """返回发布覆盖范围内、UPDATE/DELETE 会因缺少复制标识而报错的表 [(schema, name, replident)]。"""
+    """返回发布覆盖范围内、UPDATE/DELETE 会因缺少复制标识而报错的表
+    [(schema, name, replident, 可用作复制标识的唯一索引名或 None)]。"""
     explicit = [t.qualified for t in cfg.tables.values()]
     if mode == 'all':
         where = _SYSTEM_SCHEMA_FILTER
@@ -96,11 +97,18 @@ def find_bad_replica_identity(cur, cfg, mode, chunk_schemas):
         if mode == 'schema':
             where = '(%s OR n.nspname = ANY(%%s))' % where
             params.append(list(chunk_schemas))
-    # compress_hyper_* 是 TimescaleDB 内部压缩表，只被扩展内部的堆接口写入，不经过复制标识检查
+    # compress_hyper_* 是 TimescaleDB 内部压缩表，只被扩展内部的堆接口写入，不经过复制标识检查。
+    # 可用作复制标识的索引：唯一、非部分、非表达式、立即检查、有效，且所有列 NOT NULL。
     sql = """
         SELECT n.nspname, c.relname, c.relreplident,
                EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary),
-               EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident)
+               EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident),
+               (SELECT ic.relname FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                 WHERE i.indrelid = c.oid AND i.indisunique AND i.indpred IS NULL
+                   AND i.indexprs IS NULL AND i.indimmediate AND i.indisvalid
+                   AND NOT EXISTS (SELECT 1 FROM pg_attribute a
+                                    WHERE a.attrelid = c.oid AND a.attnum = ANY (i.indkey) AND NOT a.attnotnull)
+                 ORDER BY i.indnatts, ic.relname LIMIT 1)
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p') AND c.relpersistence = 'p'
           AND left(c.relname, 15) <> 'compress_hyper_'
@@ -109,9 +117,9 @@ def find_bad_replica_identity(cur, cfg, mode, chunk_schemas):
     """.format(where=where)
     cur.execute(sql, params)
     bad = []
-    for schema, name, ident, has_pk, has_ri_idx in cur.fetchall():
+    for schema, name, ident, has_pk, has_ri_idx, uniq in cur.fetchall():
         if ident == 'n' or (ident == 'd' and not has_pk) or (ident == 'i' and not has_ri_idx):
-            bad.append((schema, name, ident))
+            bad.append((schema, name, ident, uniq))
     return bad
 
 
@@ -130,20 +138,32 @@ def _hypertable_root(cur, schema, name):
     return (row[0], row[1]) if row else None
 
 
+def ri_fix_sql(schema, name, uniq):
+    """修复语句：有合适的唯一索引时用它作为复制标识（WAL 开销与主键相同），否则 FULL。"""
+    if uniq:
+        return 'ALTER TABLE %s REPLICA IDENTITY USING INDEX %s' % (qname(schema, name), qi(uniq))
+    return 'ALTER TABLE %s REPLICA IDENTITY FULL' % qname(schema, name)
+
+
 def fix_replica_identity(cur, bad, chunk_schemas):
-    """设置 REPLICA IDENTITY FULL。chunk 同时设置其超表（TimescaleDB 会传播给新 chunk）。"""
+    """修复复制标识。chunk 同时把其超表设为 FULL（TimescaleDB 会传播给新 chunk）。"""
     roots = []
-    for schema, name, _ in bad:
-        if schema in chunk_schemas:
-            root = _hypertable_root(cur, schema, name)
-            if root and root not in roots:
+    plain = []
+    for schema, name, _, uniq in bad:
+        root = _hypertable_root(cur, schema, name) if schema in chunk_schemas else None
+        if root:
+            if root not in roots:
                 roots.append(root)
+            plain.append((schema, name, None))     # chunk 统一用 FULL，与超表保持一致
+        else:
+            plain.append((schema, name, uniq))      # 普通表 / TimescaleDB 内部目录表
     for schema, name in roots:
         print('  ALTER TABLE %s REPLICA IDENTITY FULL  (超表)' % qname(schema, name))
         cur.execute('ALTER TABLE %s REPLICA IDENTITY FULL' % qname(schema, name))
-    for schema, name, _ in bad:
-        print('  ALTER TABLE %s REPLICA IDENTITY FULL' % qname(schema, name))
-        cur.execute('ALTER TABLE %s REPLICA IDENTITY FULL' % qname(schema, name))
+    for schema, name, uniq in plain:
+        stmt = ri_fix_sql(schema, name, uniq)
+        print('  ' + stmt)
+        cur.execute(stmt)
 
 
 def _timescale_warnings(cur, cfg):
@@ -214,10 +234,14 @@ def run_setup(cfg, apply=False, fix_ri=False, force=False):
         bad = find_bad_replica_identity(cur, cfg, mode, chunk_schemas)
         if bad:
             print('\n以下表没有可用的复制标识（加入发布后，源库对它们的 UPDATE/DELETE 会报错！）:')
-            for schema, name, ident in bad:
-                print('  - %s (replident=%s)' % (qname(schema, name), ident))
+            for schema, name, ident, uniq in bad:
+                note = ''
+                if schema in chunk_schemas and not name.startswith('_hyper_'):
+                    note = '  <- TimescaleDB 内部目录表（因 TABLES IN SCHEMA %s 被纳入发布）' % schema
+                print('  - %s (replident=%s)%s' % (qname(schema, name), ident, note))
+                print('      建议: %s;' % ri_fix_sql(schema, name, uniq))
             if apply and fix_ri:
-                print('\n设置 REPLICA IDENTITY FULL（更推荐为这些表添加主键）:')
+                print('\n修复复制标识（有合适唯一索引的表使用该索引，否则 REPLICA IDENTITY FULL）:')
                 fix_replica_identity(cur, bad, chunk_schemas)
                 bad = find_bad_replica_identity(cur, cfg, mode, chunk_schemas)
                 if bad:
