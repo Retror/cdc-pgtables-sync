@@ -8,7 +8,7 @@
 4. 测试写入脚本的使用方式
 5. 端到端测试流程、常见问题排查、生产切换要点
 
-> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
+> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [SWITCH_TARGET.md](SWITCH_TARGET.md)（更换 / 新增目标库） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
 
 ---
 
@@ -529,6 +529,7 @@ python3 -m pglsync -c $C reconcile --detail                 # 列出不一致的
 | 停止或重启同步 | `systemctl stop/restart pglsync-test` | 随时可以操作，重启后从目标库保存的位点继续，不丢不重 |
 | 停用同步 | 先停止服务，再执行 `python3 -m pglsync -c $C drop` | **必须执行 `drop`**，否则源库会一直保留 WAL |
 | 只删复制槽，保留发布 | `drop --keep-publication` | 准备重新初始化时使用 |
+| 更换目标库 / 新增一个目标库 | 见 [SWITCH_TARGET.md](SWITCH_TARGET.md) | 发布复用；复制槽和目标库一一对应 |
 
 ---
 
