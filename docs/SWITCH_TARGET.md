@@ -4,12 +4,99 @@
 
 | 场景 | 说明 | 详见 |
 |---|---|---|
+| **快速操作卡** | 停掉旧同步、换成新目标库，旧复制槽怎么处理（一页纸版本） | [第 0 节](#0-快速操作卡停掉旧同步换成新目标库复制槽怎么处理) |
 | **A. 更换目标库** | 不再同步到原目标库 B，改为同步到新库 C | [第 2 节](#2-场景-a更换目标库-b--c) |
 | **B. 新增一个目标库** | B 继续同步，同时也同步到 C（一个源库对多个目标库） | [第 3 节](#3-场景-b新增一个目标库b-和-c-同时同步) |
 | **A+B. 平滑切换（推荐）** | 先按场景 B 让 B、C 并行同步，确认 C 没问题后再停掉 B | [第 4 节](#4-推荐平滑切换先并行再下线旧库) |
 
 > 文中用 **A** 表示源库（例如 131），**B** 表示原目标库（例如 132），**C** 表示新目标库。
 > 命令以 Python 版为例；Java 版和 Docker 部署的对应写法见 [第 6 节](#6-三种部署方式的命令对照)。
+
+---
+
+## 0. 快速操作卡：停掉旧同步、换成新目标库，复制槽怎么处理？
+
+### 0.1 结论
+
+**旧复制槽不能留着不管。** 复制槽建在**源库**上，它会让源库一直保留“同步进程还没确认”的 WAL。旧同步停掉后，没有进程再推进这个复制槽，源库的 `pg_wal` 会越积越多，最终撑满磁盘（或者超过 `max_slot_wal_keep_size` 后复制槽失效）。所以旧复制槽要么**重建给新同步用**，要么**删除**。
+
+| 新配置里的 `slot_name` | 旧复制槽怎么处理 |
+|---|---|
+| **和原来一样（推荐）** | `init --recreate-slot` 会自动删除旧槽并新建，**不用手动删** |
+| **换了新名字** | 先用**旧配置**执行 `drop --keep-publication` 删除旧槽（**一定要带 `--keep-publication`**，否则发布也会被删掉） |
+| **以后完全不再从这个源库同步** | 执行不带参数的 `drop`：复制槽和发布一起删除，见 [第 5 节](#5-彻底停用不再从源库同步任何数据) |
+
+另外两点：
+
+- **发布不用删**，新同步直接复用；
+- **旧目标库上的业务数据不会被删**，会停留在停止同步那一刻的状态。
+
+### 0.2 操作步骤（源库不变，只换目标库）
+
+```bash
+# ① 停止旧的同步进程（程序会处理完当前事务、提交位点后再退出）
+sudo systemctl stop pglsync              # 前台运行按 Ctrl+C；Docker 用 docker compose stop pglsync
+python3 -m pglsync -c config.json status # 确认“是否活跃: 否”
+
+# ② 准备新目标库：建库、建表（pg_dump -s 导出表结构并删掉其中的触发器）、超表、pg_hba.conf 放行
+#    详见 2.2 节第 ① 步
+
+# ③ 复制一份配置，只把 target 改成新目标库（旧配置留着，方便回退）
+cp config.json config.new.json
+vi config.new.json                       # 只改 target；slot_name、publication 保持不变
+
+# ④ 用新配置初始化：自动删除旧复制槽并新建；发布直接复用
+python3 -m pglsync -c config.new.json check
+python3 -m pglsync -c config.new.json init --recreate-slot                                   # 新库是空表：全量复制
+# 或：python3 -m pglsync -c config.new.json init --no-copy --recreate-slot --on-mismatch copy  # 新库已有数据：核对后开始
+
+# ⑤ 用新配置启动同步（systemd 的话，把服务文件中 ExecStart 的 -c 参数改成 config.new.json）
+sudo systemctl daemon-reload && sudo systemctl start pglsync
+
+# ⑥ 验证
+python3 -m pglsync -c config.new.json status       # 是否活跃: 是；落后接近 0
+python3 -m pglsync -c config.new.json reconcile    # 全部一致
+
+# ⑦（可选）清理旧目标库上 pglsync 自己的位点表（业务数据不受影响）
+psql -h <旧目标库> -U postgres -d typhoon -c 'DROP SCHEMA pglsync CASCADE;'
+```
+
+**如果第 ③ 步把 `slot_name` 改成了新名字**，要在第 ④ 步之前先删除旧复制槽：
+
+```bash
+python3 -m pglsync -c config.json drop --keep-publication   # 用旧配置：删除旧复制槽和旧目标库上的位点，保留发布
+```
+
+完成后，在源库上确认只剩新的复制槽：
+
+```sql
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots;
+```
+
+### 0.3 如果源库也换了
+
+源库换了，就是一条全新的同步链路，和旧链路没有任何关系：
+
+1. **清理旧源库**：用旧配置执行**不带参数**的 `drop`，删除旧源库上的复制槽和发布：
+   ```bash
+   sudo systemctl stop pglsync
+   python3 -m pglsync -c config.json drop
+   ```
+   如果旧源库以后不再需要逻辑复制，可以把它的 `wal_level` 改回 `replica`（需要重启）。
+2. **配置新源库**：按 [USER_GUIDE.md 第 2.1 节](USER_GUIDE.md#21-源库131配置) 修改参数（`wal_level = logical` 等，需要重启）。
+3. **新建配置**：`source` 和 `target` 都指向新库。
+4. **按首次部署流程执行**：`check` → `setup` → `init`（或 `init --no-copy`）→ `run`。
+
+### 0.4 三种部署方式的写法
+
+| 步骤 | Python 版 | Java 版 | Docker |
+|---|---|---|---|
+| 停止 | `systemctl stop pglsync` | `systemctl stop pglsync-java` | `docker compose stop pglsync` |
+| 重建复制槽并初始化 | `python3 -m pglsync -c config.new.json init --recreate-slot` | `java -jar pglsync.jar init --recreate-slot --spring.config.additional-location=file:application-new.yml` | 把新配置挂载为 `/app/config/config.json`，然后 `docker compose run --rm pglsync init --recreate-slot` |
+| 删除旧复制槽，保留发布 | `drop --keep-publication` | `drop --keep-publication` | `docker compose run --rm pglsync drop -y --keep-publication` |
+| 彻底停用 | `drop` | `drop` | `docker compose run --rm pglsync drop -y` |
 
 ---
 
