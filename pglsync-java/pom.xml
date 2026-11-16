@@ -20,6 +20,8 @@
     <properties>
         <java.version>1.8</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 覆盖 Spring Boot 2.7 默认的 42.3.x：较新的驱动对 PG17/18 支持更好，42.7.x 仍支持 JDK 8 -->
+        <postgresql.version>42.7.4</postgresql.version>
     </properties>
 
     <dependencies>

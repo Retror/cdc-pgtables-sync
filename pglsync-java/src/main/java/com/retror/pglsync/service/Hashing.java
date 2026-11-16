@@ -94,7 +94,9 @@ public final class Hashing {
                                                        List<String> pk, String since, String bucket)
             throws SQLException {
         String rowHash = "md5(ROW(" + Sql.qcols(cols) + ")::text)";
-        String order = Sql.qcols(pk);
+        // 按主键的文本表示 + C 排序规则排序：不依赖两边数据库的排序规则（collation），
+        // 源库和目标库的 PostgreSQL / glibc / ICU 版本不同时，也能得到相同的行顺序
+        String order = "ROW(" + Sql.qcols(pk) + ")::text COLLATE \"C\"";
         String bucketExpr = t.getTimeColumn() != null
                 ? "date_trunc('" + t.getBucket() + "', " + Sql.qi(t.getTimeColumn()) + ")::text"
                 : "'*'";
