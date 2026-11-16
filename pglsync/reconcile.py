@@ -51,7 +51,9 @@ def _where(table, since, bucket):
 def bucket_hashes(conn, table, cols, pk, since=None, bucket=None):
     """返回 {桶: (行数, 哈希)}"""
     row_hash = 'md5(ROW(%s)::text)' % ', '.join(qi(c) for c in cols)
-    order = ', '.join(qi(c) for c in pk)
+    # 按主键的文本表示 + C 排序规则排序：不依赖两边数据库的排序规则（collation），
+    # 源库和目标库的 PostgreSQL / glibc / ICU 版本不同时，也能得到相同的行顺序
+    order = 'ROW(%s)::text COLLATE "C"' % ', '.join(qi(c) for c in pk)
     if table.time_column:
         bucket_expr = "date_trunc('%s', %s)::text" % (table.bucket, qi(table.time_column))
     else:
