@@ -932,6 +932,8 @@ python3 -m pglsync -c $C reconcile -t public.tcrealtime
 | `复制槽正被进程 xxx 占用` | 有另一个 `run` 进程在运行 | 只保留一个同步进程 |
 | `column c.schema_name does not exist` | 旧版代码依赖 TimescaleDB 内部表结构 | 已在提交 `6aeb368` 修复，执行 `git pull` 后重启 |
 | `init --no-copy` 报告不一致 | 上次同步之后源库又有写入，或者历史数据本来就不一致 | `init --no-copy --on-mismatch copy` |
+| 源库执行了大批量 DELETE / UPDATE（几百万行）后，目标库迟迟没有变化，`status` 中“目标库同步位点”长时间不动 | **大事务正在处理中，并没有丢**：① 源库要先把整个事务的 WAL 解码完（超过 `logical_decoding_work_mem` 的部分会写到 `pg_replslot/` 下的临时文件）；② 事务提交后才整体发给 pglsync；③ pglsync 在目标库**用一个事务**应用全部变更，全部完成后才提交并推进位点。这期间之后的其他事务都要排队 | 在日志中查看“正在应用大事务 xid=…：已处理 N 条变更”的进度；源库 `SELECT * FROM pg_stat_replication_slots` 中 `spill_*` 在增长、目标库 `pg_stat_activity` 中 pglsync 的连接处于 active，都说明正在处理。新版本会把连续的 DELETE 合并成批量语句，速度明显提升。超表上大范围删除历史数据，更推荐两边各自执行 `drop_chunks` |
+| 超表启用了**压缩**，删除已压缩时间段的数据后，目标库没有同步删除 | TimescaleDB 删除已压缩的数据时，可能直接删除整批压缩数据，而不会产生逐行删除记录，逻辑复制无法捕获 | 在目标库执行同样的 DELETE，或者执行 `resync -t 表`。用 `timescaledb_information.chunks` 的 `is_compressed` 列确认相关 chunk 是否已压缩 |
 | `check` 提示 `_timescaledb_internal.bgw_policy_chunk_stats`（或其他 `_timescaledb_internal` 下非 `_hyper_` 开头的表）缺少复制标识 | PG15+ 的发布用 `TABLES IN SCHEMA _timescaledb_internal` 来覆盖超表的 chunk，这个 schema 里还有 TimescaleDB 自己的内部表，它们也会被纳入发布。这类表没有主键，被扩展以普通 SQL 删改时（比如外键级联删除）会报错 | 执行 `setup --fix-replica-identity`：表上有合适的唯一索引时，用 `REPLICA IDENTITY USING INDEX` 指定它作为复制标识，否则用 `FULL`。这类表只有几行，开销可以忽略。**升级 TimescaleDB 之后再执行一次 `check`**（升级可能重建内部表） |
 | 日志报列数不匹配，或者 `column ... does not exist` | 两边表结构不一致（源库改了表，目标库没改，或者顺序反了） | 按第 8.5 节处理：补齐目标库结构后程序自动恢复，不丢数据；或者用通用流程加 `resync` |
 | 进程退出，提示“复制标识不包含主键列” | 修改了主键，但配置文件里的 `pk` 没改；或者源表的主键被删了 | 按第 8.5.4 节的通用流程修改配置并执行 `resync` |
