@@ -48,15 +48,17 @@ public class Applier {
         return missingRows;
     }
 
-    /** 待合并写入的 upsert 组：同一张表、同一组列。 */
+    /** 待合并写入的组：同一张表、同一组列的 upsert，或同一张表的 delete。 */
     private static final class Group {
+        final boolean delete;
         final RelationInfo info;
         final List<String> cols;
         final String key;
-        /** 主键值 -> 整行值（同一批内同主键只保留最后一次）。 */
+        /** upsert：主键值 -> 整行值（同一批内同主键只保留最后一次）；delete：主键值 -> 主键值。 */
         final LinkedHashMap<List<String>, List<String>> rows = new LinkedHashMap<>();
 
-        Group(RelationInfo info, List<String> cols, String key) {
+        Group(boolean delete, RelationInfo info, List<String> cols, String key) {
+            this.delete = delete;
             this.info = info;
             this.cols = cols;
             this.key = key;
@@ -108,12 +110,12 @@ public class Applier {
 
     private void upsert(RelationInfo info, LinkedHashMap<String, String> values) throws SQLException {
         List<String> cols = new ArrayList<>(values.keySet());
-        String key = info.target.qualified() + "|" + String.join(",", cols);
+        String key = "U|" + info.target.qualified() + "|" + String.join(",", cols);
         if (group != null && !group.key.equals(key)) {
             flushPending();
         }
         if (group == null) {
-            group = new Group(info, cols, key);
+            group = new Group(false, info, cols, key);
         }
         List<String> pkValue = new ArrayList<>();
         for (String c : info.pk) {
@@ -126,6 +128,42 @@ public class Applier {
         }
     }
 
+    /** 连续的同表 DELETE 合并为 DELETE ... WHERE (pk) IN (VALUES ...)，大批量删除时减少网络往返。 */
+    private void deleteBatched(RelationInfo info, List<String> pkValues) throws SQLException {
+        String key = "D|" + info.target.qualified();
+        if (group != null && !group.key.equals(key)) {
+            flushPending();
+        }
+        if (group == null) {
+            group = new Group(true, info, info.pk, key);
+        }
+        group.rows.put(pkValues, pkValues);
+        if (group.rows.size() >= cfg.getUpsertGroupSize()) {
+            flushPending();
+        }
+    }
+
+    static String deleteBatchSql(RelationInfo info, int nrows) {
+        // VALUES 中的参数需要显式类型，否则与主键列比较时会类型不匹配
+        StringBuilder one = new StringBuilder("(");
+        for (int i = 0; i < info.pkTypes.size(); i++) {
+            if (i > 0) {
+                one.append(", ");
+            }
+            one.append("?::").append(info.pkTypes.get(i));
+        }
+        one.append(")");
+        StringBuilder sb = new StringBuilder("DELETE FROM ").append(table(info))
+                .append(" WHERE (").append(Sql.qcols(info.pk)).append(") IN (VALUES ");
+        for (int i = 0; i < nrows; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(one);
+        }
+        return sb.append(")").toString();
+    }
+
     public void flushPending() throws SQLException {
         Group g = group;
         if (g == null) {
@@ -136,7 +174,16 @@ public class Applier {
         List<List<String>> rows = new ArrayList<>(g.rows.values());
         for (int i = 0; i < rows.size(); i += perStmt) {
             List<List<String>> page = rows.subList(i, Math.min(rows.size(), i + perStmt));
-            exec.update(upsertSql(g.info, g.cols, page.size()), flatten(page));
+            if (g.delete) {
+                int n = exec.update(deleteBatchSql(g.info, page.size()), flatten(page));
+                if (n < page.size()) {
+                    // 删除本就不存在的行不影响最终一致性，仅记录
+                    missingRows += page.size() - n;
+                    log.debug("DELETE {} 有 {} 行未命中目标行", g.info.target, page.size() - n);
+                }
+            } else {
+                exec.update(upsertSql(g.info, g.cols, page.size()), flatten(page));
+            }
         }
     }
 
@@ -272,7 +319,6 @@ public class Applier {
     }
 
     public void delete(RelationInfo info, char oldKind, List<PgOutput.Value> oldTuple) throws SQLException {
-        flushPending();
         Row old = toRow(info, oldTuple);
         List<String> pkValues = new ArrayList<>();
         for (String c : info.pk) {
@@ -282,6 +328,12 @@ public class Applier {
             }
             pkValues.add(v);
         }
+        if (info.pkTypes != null) {
+            deleteBatched(info, pkValues);
+            return;
+        }
+        // 主键类型未知时逐行删除
+        flushPending();
         int n = exec.update("DELETE FROM " + table(info) + " WHERE " + wherePk(info.pk), pkValues);
         if (n == 0) {
             // 删除一条本就不存在的行不影响最终一致性，仅记录

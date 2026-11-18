@@ -31,6 +31,7 @@ import java.util.function.BooleanSupplier;
  */
 public class Session {
     private static final Logger log = LoggerFactory.getLogger(Session.class);
+    private static final long TXN_PROGRESS_EVERY = 100_000;
 
     private final SyncConfig cfg;
     private final ReplicationIo io;
@@ -41,6 +42,9 @@ public class Session {
     long lastEnd;
     long flushed;
     private long txnLsn;
+    private long txnXid;
+    private long txnChanges;
+    private long txnStartedMs;
     boolean inTxn;
     private boolean skipTxn;
     Long pendingEnd;
@@ -108,6 +112,9 @@ public class Session {
             }
             inTxn = true;
             txnLsn = b.finalLsn;
+            txnXid = b.xid;
+            txnChanges = 0;
+            txnStartedMs = System.currentTimeMillis();
             skipTxn = b.finalLsn < lastEnd;
             if (skipTxn) {
                 statSkippedTxns++;
@@ -144,6 +151,12 @@ public class Session {
             int n = apply(m);
             batchChanges += n;
             statChanges += n;
+            txnChanges++;
+            if (txnChanges % TXN_PROGRESS_EVERY == 0) {
+                // 大事务（例如一次删除几百万行）在提交到目标库之前不会推进位点，这里输出进度便于观察
+                log.info(String.format("正在应用大事务 xid=%d：已处理 %d 条变更，耗时 %.0fs（整个事务完成后才会提交到目标库）",
+                        txnXid, txnChanges, (System.currentTimeMillis() - txnStartedMs) / 1000.0));
+            }
         }
         // Origin / Type / LogicalMessage：忽略
     }

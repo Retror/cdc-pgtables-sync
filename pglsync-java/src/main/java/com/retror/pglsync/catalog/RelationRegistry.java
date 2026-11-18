@@ -133,6 +133,7 @@ public class RelationRegistry implements AutoCloseable {
             info.target = table;
             try {
                 info.pk = validate(table, info);
+                info.pkTypes = pkTypes(rel, info.pk);
                 log.debug("relation {} (relid={}) -> {} pk={}", info.sourceName(), rel.relid, table, info.pk);
             } catch (ConfigException e) {
                 // 可能是表结构变更前的旧 Relation，其变更会因 resync 位点而被跳过；应用时才报错
@@ -142,6 +143,75 @@ public class RelationRegistry implements AutoCloseable {
         }
         rels.put(rel.relid, info);
         return info;
+    }
+
+    /** 常见内置类型的 OID（PostgreSQL 各版本固定不变）。 */
+    private static final Map<Long, String> BUILTIN_TYPES = new HashMap<>();
+
+    static {
+        BUILTIN_TYPES.put(16L, "boolean");
+        BUILTIN_TYPES.put(20L, "bigint");
+        BUILTIN_TYPES.put(21L, "smallint");
+        BUILTIN_TYPES.put(23L, "integer");
+        BUILTIN_TYPES.put(25L, "text");
+        BUILTIN_TYPES.put(26L, "oid");
+        BUILTIN_TYPES.put(114L, "json");
+        BUILTIN_TYPES.put(700L, "real");
+        BUILTIN_TYPES.put(701L, "double precision");
+        BUILTIN_TYPES.put(869L, "inet");
+        BUILTIN_TYPES.put(1042L, "character");
+        BUILTIN_TYPES.put(1043L, "character varying");
+        BUILTIN_TYPES.put(1082L, "date");
+        BUILTIN_TYPES.put(1083L, "time without time zone");
+        BUILTIN_TYPES.put(1114L, "timestamp without time zone");
+        BUILTIN_TYPES.put(1184L, "timestamp with time zone");
+        BUILTIN_TYPES.put(1186L, "interval");
+        BUILTIN_TYPES.put(1266L, "time with time zone");
+        BUILTIN_TYPES.put(1700L, "numeric");
+        BUILTIN_TYPES.put(2950L, "uuid");
+        BUILTIN_TYPES.put(3802L, "jsonb");
+    }
+
+    private final Map<Long, String> typeCache = new HashMap<>();
+
+    /** 类型 OID -> 可用于 ::cast 的类型名。内置类型直接查表，其余查源库；无法确定时返回 null。 */
+    protected String typeName(long oid) throws SQLException {
+        String name = BUILTIN_TYPES.get(oid);
+        if (name != null) {
+            return name;
+        }
+        if (typeCache.containsKey(oid)) {
+            return typeCache.get(oid);
+        }
+        try (PreparedStatement ps = conn().prepareStatement("SELECT format_type(?::oid, NULL)")) {
+            ps.setLong(1, oid);
+            try (ResultSet rs = ps.executeQuery()) {
+                name = rs.next() ? rs.getString(1) : null;
+            }
+        }
+        if (name != null && name.startsWith("???")) {
+            name = null;
+        }
+        typeCache.put(oid, name);
+        return name;
+    }
+
+    private List<String> pkTypes(PgOutput.Relation rel, List<String> pk) throws SQLException {
+        List<String> types = new ArrayList<>();
+        for (String c : pk) {
+            String name = null;
+            for (PgOutput.Column col : rel.columns) {
+                if (col.name.equals(c)) {
+                    name = typeName(col.typeOid);
+                    break;
+                }
+            }
+            if (name == null) {
+                return null;
+            }
+            types.add(name);
+        }
+        return types;
     }
 
     static List<String> validate(TableConfig table, RelationInfo info) {

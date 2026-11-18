@@ -138,6 +138,39 @@ class ApplierTest {
     }
 
     @Test
+    void batchedDeletes() throws Exception {
+        Recorder r = new Recorder();
+        r.rowcount = 2;
+        Applier a = new Applier(TestSupport.config(), r);
+        RelationInfo h = info(new TableConfig("public", "h"), Arrays.asList("id", "ts", "v"),
+                Arrays.asList("id", "ts"), false);
+        h.pkTypes = Arrays.asList("bigint", "timestamp with time zone");
+        for (int i = 0; i < 3; i++) {
+            a.delete(h, 'K', Arrays.asList(t(String.valueOf(i)), t("2026-11-01 00:00:00+00"), n()));
+        }
+        assertTrue(r.sqls.isEmpty());
+        a.commit(16);
+        assertEquals("DELETE FROM \"public\".\"h\" WHERE (\"id\", \"ts\") IN (VALUES "
+                + "(?::bigint, ?::timestamp with time zone), (?::bigint, ?::timestamp with time zone), "
+                + "(?::bigint, ?::timestamp with time zone))", r.sqls.get(0));
+        assertEquals(6, r.params.get(0).size());
+        assertEquals(1, a.getMissingRows());
+    }
+
+    @Test
+    void batchedDeleteFlushedBeforeInsert() throws Exception {
+        Recorder r = new Recorder();
+        Applier a = new Applier(TestSupport.config(), r);
+        RelationInfo i = info();
+        i.pkTypes = Arrays.asList("bigint");
+        a.delete(i, 'K', Arrays.asList(t("1"), n(), n()));
+        a.insert(i, Arrays.asList(t("1"), t("a"), t("x")));
+        a.flushPending();
+        assertTrue(r.sqls.get(0).startsWith("DELETE"));
+        assertTrue(r.sqls.get(1).startsWith("INSERT"));
+    }
+
+    @Test
     void truncateNormalAndChunk() throws Exception {
         Recorder r = new Recorder();
         Applier a = new Applier(TestSupport.config(), r);

@@ -20,6 +20,8 @@ public class RelationInfo {
     public boolean chunk;
     /** 校验失败原因；真正需要应用该 relation 的变更时才报错。 */
     public String invalid;
+    /** 主键列的类型名（批量 DELETE 时用于显式类型转换）；null 表示未知，DELETE 逐行执行。 */
+    public List<String> pkTypes;
 
     public RelationInfo(long relid, String namespace, String name, char replident,
                         List<String> colNames, List<String> keyCols) {
