@@ -10,11 +10,20 @@ log = logging.getLogger('pglsync.catalog')
 
 _CHUNK_NAME_RE = re.compile(r'^_hyper_(\d+)_\d+_chunk$')
 
+# 常见内置类型的 OID（PostgreSQL 各版本固定不变）
+_BUILTIN_TYPES = {
+    16: 'boolean', 20: 'bigint', 21: 'smallint', 23: 'integer', 25: 'text', 26: 'oid',
+    700: 'real', 701: 'double precision', 1042: 'character', 1043: 'character varying',
+    1082: 'date', 1083: 'time without time zone', 1114: 'timestamp without time zone',
+    1184: 'timestamp with time zone', 1186: 'interval', 1266: 'time with time zone',
+    1700: 'numeric', 2950: 'uuid', 869: 'inet', 3802: 'jsonb', 114: 'json',
+}
+
 
 class RelationInfo(object):
     """一个源库 relation（pgoutput 的 relid）及其映射到的目标表。"""
     __slots__ = ('relid', 'namespace', 'name', 'replident', 'col_names',
-                 'key_cols', 'target', 'pk', 'is_chunk', 'invalid')
+                 'key_cols', 'target', 'pk', 'is_chunk', 'invalid', 'col_types', 'pk_types')
 
     def __init__(self, relid, namespace, name, replident, col_names, key_cols,
                  target=None, pk=None, is_chunk=False):
@@ -28,6 +37,8 @@ class RelationInfo(object):
         self.pk = pk              # 目标表主键列（用于 ON CONFLICT / WHERE）
         self.is_chunk = is_chunk
         self.invalid = None       # 校验失败原因；应用该 relation 的变更时才报错
+        self.col_types = {}       # 列名 -> 类型 OID（来自 Relation 消息）
+        self.pk_types = None      # 主键列的类型名（批量 DELETE 时用于显式类型转换）
 
     @property
     def source_name(self):
@@ -42,6 +53,7 @@ class RelationRegistry(object):
         self._connect = connect
         self._rels = {}
         self._chunk_cache = {}
+        self._type_cache = {}
         self._conn = None
 
     # ---------- 源库元数据连接（autocommit，查询失败不会污染其他事务） ----------
@@ -124,8 +136,10 @@ class RelationRegistry(object):
         table = self.cfg.tables.get(target_key) if target_key else None
         if table is not None:
             info.target = table
+            info.col_types = dict((c.name, c.type_oid) for c in rel.columns)
             try:
                 info.pk = self._validate(table, info)
+                info.pk_types = self._pk_types(info)
                 log.debug('relation %s (relid=%d) -> %s pk=%s', info.source_name, rel.relid,
                           table.qualified, info.pk)
             except ConfigError as e:
@@ -135,6 +149,33 @@ class RelationRegistry(object):
                 log.debug('relation %s 暂不可用: %s', info.source_name, e)
         self._rels[rel.relid] = info
         return info
+
+    def type_name(self, oid):
+        """类型 OID -> 可用于 ::cast 的类型名。内置类型 OID 在各版本中固定，直接查表；其余查源库。"""
+        name = _BUILTIN_TYPES.get(oid)
+        if name is not None:
+            return name
+        if oid in self._type_cache:
+            return self._type_cache[oid]
+        cur = self._cursor()
+        try:
+            cur.execute('SELECT format_type(%s, NULL)', (oid,))
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        name = row[0] if row and row[0] and not row[0].startswith('???') else None
+        self._type_cache[oid] = name
+        return name
+
+    def _pk_types(self, info):
+        """主键列类型名；任何一列无法确定时返回 None（DELETE 退回逐行执行）。"""
+        types = []
+        for c in info.pk:
+            name = self.type_name(info.col_types.get(c))
+            if not name:
+                return None
+            types.append(name)
+        return types
 
     @staticmethod
     def _validate(table, info):

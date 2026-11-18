@@ -126,10 +126,12 @@ class ApplierHarness(object):
     def __init__(self, cfg=None, rowcount=1):
         self.conn = FakeConn(rowcount)
         self.batches = []
+        self.templates = []
         self.applier = Applier(cfg or make_cfg(), self.conn, execute_values=self._ev)
 
-    def _ev(self, cur, sql, rows, page_size=None):
+    def _ev(self, cur, sql, rows, template=None, page_size=None):
         self.batches.append((sql, list(rows)))
+        self.templates.append(template)
 
     @property
     def executed(self):
@@ -268,6 +270,31 @@ class ApplierTest(unittest.TestCase):
         info = make_info(cols=('id', 'ts', 'v'), pk=('id', 'ts'), target=TableConfig('public', 'h', pk=['id', 'ts']))
         h.applier.delete(info, 'K', [('t', '1'), ('t', '2026-01-01 00:00:00'), ('n', None)])
         self.assertEqual(h.executed[0][0], 'DELETE FROM "public"."h" WHERE "id" = %s AND "ts" = %s')
+
+    def test_batched_deletes(self):
+        h = ApplierHarness(rowcount=2)
+        info = make_info(cols=('id', 'ts', 'v'), pk=('id', 'ts'), target=TableConfig('public', 'h', pk=['id', 'ts']))
+        info.pk_types = ['bigint', 'timestamp with time zone']
+        for i in range(3):
+            h.applier.delete(info, 'K', [('t', str(i)), ('t', '2026-11-01 00:00:00+00'), ('n', None)])
+        self.assertEqual(h.batches, [])          # 还在合并中
+        h.applier.commit(lsn_to_int('0/10'))
+        sql, rows = h.batches[0]
+        self.assertEqual(sql, 'DELETE FROM "public"."h" WHERE ("id", "ts") IN (VALUES %s)')
+        self.assertEqual(h.templates[0], '(%s::bigint, %s::timestamp with time zone)')
+        self.assertEqual(rows, [('0', '2026-11-01 00:00:00+00'), ('1', '2026-11-01 00:00:00+00'),
+                                ('2', '2026-11-01 00:00:00+00')])
+        self.assertEqual(h.applier.missing_rows, 1)   # 3 行只删到 2 行
+
+    def test_batched_delete_flushed_before_insert(self):
+        h = ApplierHarness()
+        info = make_info()
+        info.pk_types = ['bigint']
+        h.applier.delete(info, 'K', [('t', '1'), ('n', None), ('n', None)])
+        h.applier.insert(info, [('t', '1'), ('t', 'a'), ('t', 'x')])
+        h.applier.flush_pending()
+        self.assertTrue(h.batches[0][0].startswith('DELETE'))
+        self.assertTrue(h.batches[1][0].startswith('INSERT'))
 
     def test_truncate(self):
         h = ApplierHarness()

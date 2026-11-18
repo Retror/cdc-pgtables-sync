@@ -87,11 +87,11 @@ class Applier(object):
     # --------------------------------------------------------- upsert 合并
     def _upsert(self, info, values):
         cols = tuple(values.keys())
-        key = (info.target.qualified, cols)
+        key = ('upsert', info.target.qualified, cols)
         if self._group is not None and self._group['key'] != key:
             self.flush_pending()
         if self._group is None:
-            self._group = {'key': key, 'info': info, 'cols': cols, 'rows': OrderedDict()}
+            self._group = {'key': key, 'kind': 'upsert', 'info': info, 'cols': cols, 'rows': OrderedDict()}
         rows = self._group['rows']
         pk_value = tuple(values[c] for c in info.pk)
         # 同一批内同主键只保留最后一次（全是整行 upsert，最终状态等价）
@@ -100,14 +100,47 @@ class Applier(object):
         if len(rows) >= self.cfg.upsert_group_size:
             self.flush_pending()
 
+    # --------------------------------------------------------- delete 合并
+    def _delete_batched(self, info, pk_values):
+        """连续的同表 DELETE 合并为 DELETE ... WHERE (pk) IN (VALUES ...)，大批量删除时减少网络往返。"""
+        key = ('delete', info.target.qualified)
+        if self._group is not None and self._group['key'] != key:
+            self.flush_pending()
+        if self._group is None:
+            self._group = {'key': key, 'kind': 'delete', 'info': info, 'rows': OrderedDict()}
+        self._group['rows'][tuple(pk_values)] = None
+        if len(self._group['rows']) >= self.cfg.upsert_group_size:
+            self.flush_pending()
+
+    def _delete_batch_sql(self, info):
+        key = ('delete_batch', info.target.qualified, tuple(info.pk), tuple(info.pk_types))
+        stmt = self._sql_cache.get(key)
+        if stmt is None:
+            # VALUES 中的参数需要显式类型，否则会被当作 text，与主键列比较时报类型不匹配
+            template = '(%s)' % ', '.join('%%s::%s' % t for t in info.pk_types)
+            stmt = ('DELETE FROM %s WHERE (%s) IN (VALUES %%s)'
+                    % (qname(info.target.schema, info.target.name), ', '.join(qi(c) for c in info.pk)), template)
+            self._sql_cache[key] = stmt
+        return stmt
+
     def flush_pending(self):
         group = self._group
         if group is None:
             return
         self._group = None
-        rows = list(group['rows'].values())
-        stmt = self._sql('upsert', group['info'], group['cols'])
-        self._execute_values(self.cur, stmt, rows, page_size=len(rows))
+        rows = list(group['rows'].keys() if group['kind'] == 'delete' else group['rows'].values())
+        if group['kind'] == 'upsert':
+            stmt = self._sql('upsert', group['info'], group['cols'])
+            self._execute_values(self.cur, stmt, rows, page_size=len(rows))
+            return
+        info = group['info']
+        stmt, template = self._delete_batch_sql(info)
+        self._execute_values(self.cur, stmt, rows, template=template, page_size=len(rows))
+        missing = len(rows) - max(self.cur.rowcount, 0)
+        if missing > 0:
+            # 删除本就不存在的行不影响最终一致性，仅记录
+            self.missing_rows += missing
+            log.debug('DELETE %s 有 %d 行未命中目标行', info.target.qualified, missing)
 
     # ------------------------------------------------------------ 变更类型
     def insert(self, info, new):
@@ -165,11 +198,15 @@ class Applier(object):
             self._missing('UPDATE', info, new_pk)
 
     def delete(self, info, old_kind, old):
-        self.flush_pending()
         old_values, _ = tuple_to_row(info, old)
         pk_values = [old_values.get(c) for c in info.pk]
         if any(v is None for v in pk_values):
             raise ApplyError('DELETE %s 缺少主键值（复制标识不包含主键列 %s）' % (info.target.qualified, info.pk))
+        if getattr(info, 'pk_types', None):
+            self._delete_batched(info, pk_values)
+            return
+        # 主键类型未知时逐行删除
+        self.flush_pending()
         self.cur.execute(self._sql('delete', info), pk_values)
         if self.cur.rowcount == 0:
             # 删除一条本就不存在的行不影响最终一致性，仅记录

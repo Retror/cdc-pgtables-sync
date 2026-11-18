@@ -21,6 +21,8 @@ from .utils import int_to_lsn, pg_timestamp_to_datetime
 
 log = logging.getLogger('pglsync.stream')
 
+TXN_PROGRESS_EVERY = 100000
+
 
 def _close_quietly(conn, rollback=False):
     if conn is None or conn.closed:
@@ -147,6 +149,9 @@ class _Session(object):
         self.registry = registry
         self.table_lsns = dict(table_lsns or {})   # resync 过的表 -> 快照位点
         self.txn_lsn = 0                # 当前事务的提交位点（Begin.final_lsn）
+        self.txn_xid = 0
+        self.txn_changes = 0
+        self.txn_started = 0.0
         self.last_end = start_lsn       # 已处理（可能尚未提交到目标库）的最后一个事务 end_lsn
         self.flushed = start_lsn        # 已确认给源库的位点
         self.in_txn = False
@@ -198,6 +203,9 @@ class _Session(object):
                 raise pgoutput.DecodeError('收到嵌套的 BEGIN')
             self.in_txn = True
             self.txn_lsn = m.final_lsn
+            self.txn_xid = m.xid
+            self.txn_changes = 0
+            self.txn_started = time.time()
             self.skip_txn = m.final_lsn < self.last_end
             if self.skip_txn:
                 self.stats['skipped_txns'] += 1
@@ -226,6 +234,11 @@ class _Session(object):
             n = self._apply(m)
             self.batch_changes += n
             self.stats['changes'] += n
+            self.txn_changes += 1
+            if self.txn_changes % TXN_PROGRESS_EVERY == 0:
+                # 大事务（例如一次删除几百万行）在提交到目标库之前不会推进位点，这里输出进度便于观察
+                log.info('正在应用大事务 xid=%d：已处理 %d 条变更，耗时 %.0fs（整个事务完成后才会提交到目标库）',
+                         self.txn_xid, self.txn_changes, time.time() - self.txn_started)
         # Origin / Type / LogicalMessage：忽略
 
     def _wanted(self, info):
