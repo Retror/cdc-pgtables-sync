@@ -15,7 +15,7 @@ ExecStart=/usr/bin/java -Xms256m -Xmx1g -jar /opt/pglsync-java/pglsync.jar run \
     --spring.config.additional-location=file:/opt/pglsync-java/application.yml
 Restart=always
 RestartSec=10
-# 收到 SIGTERM 后会处理完当前事务再退出
+# 收到 SIGTERM 后：已完成的事务先提交，正在应用的事务回滚（重启后重新接收）
 KillSignal=SIGTERM
 TimeoutStopSec=120
 SuccessExitStatus=143

@@ -78,7 +78,14 @@ public class Session {
     public void loop(BooleanSupplier shouldStop) throws Exception {
         long batchMaxMs = (long) (cfg.getBatchMaxSeconds() * 1000);
         while (true) {
-            if (shouldStop.getAsBoolean() && !inTxn) {
+            if (shouldStop.getAsBoolean()) {
+                if (inTxn) {
+                    // 正在应用的事务尚未提交到目标库、也未向源库确认，回滚即可；重启后源库会重新发送
+                    log.warn("停止时正在应用事务 xid={}（已处理 {} 条变更），回滚目标库中未提交的部分，重启后会重新接收，不会丢数据",
+                            txnXid, txnChanges);
+                    applier.rollback();
+                    return;
+                }
                 break;
             }
             ByteBuffer msg = io.readPending();

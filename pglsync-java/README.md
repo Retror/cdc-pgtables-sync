@@ -157,7 +157,7 @@ sudo systemctl enable --now pglsync-java
 journalctl -u pglsync-java -f
 ```
 
-收到 `SIGTERM`（`systemctl stop`）后，程序会处理完当前事务、提交位点后再退出。
+收到 `SIGTERM`（`systemctl stop`）后，程序会先提交已完成的事务；正在应用的事务会回滚（重启后重新接收，不会丢数据），然后退出。
 
 ### 4.3 日常运维
 

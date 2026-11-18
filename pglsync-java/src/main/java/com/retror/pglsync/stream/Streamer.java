@@ -21,7 +21,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/** 增量同步主循环：断线自动重连（指数退避），收到停止信号后处理完当前事务再退出。 */
+/** 增量同步主循环：断线自动重连（指数退避）；收到停止信号后，事务之间直接退出，正在应用的事务回滚（重启后重新接收）。 */
 public class Streamer {
     private static final Logger log = LoggerFactory.getLogger(Streamer.class);
 
@@ -35,7 +35,7 @@ public class Streamer {
 
     public void requestStop() {
         if (!stop) {
-            log.info("收到停止信号，处理完当前事务后退出...");
+            log.info("收到停止信号：事务之间直接退出；正在应用的事务会回滚，重启后重新接收...");
         }
         stop = true;
     }
