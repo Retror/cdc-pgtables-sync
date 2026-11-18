@@ -14,7 +14,7 @@ EnvironmentFile=/data/pglsync/pglsync.env
 ExecStart=/usr/bin/python3 -m pglsync -c /data/pglsync/config.json run
 Restart=always
 RestartSec=10
-# 进程收到 SIGTERM 后会处理完当前事务再退出
+# 进程收到 SIGTERM 后：已完成的事务先提交，正在应用的事务回滚（重启后重新接收）
 KillSignal=SIGTERM
 TimeoutStopSec=120
 

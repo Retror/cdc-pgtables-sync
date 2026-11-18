@@ -400,6 +400,16 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(h.conn.commits, 0)
         self.assertEqual(cur.feedback, [20])
 
+    def test_stop_during_transaction_rolls_back_without_confirming(self):
+        s, h, cur = self._session(start_lsn=0)
+        s.handle(msg_relation(1, 'public', 't', [('id', True), ('name', False), ('big', False)]))
+        s.handle(msg_begin(10))
+        s.handle(msg_insert(1, '1', 'a', None))
+        s.loop(lambda: True)                      # 停止信号到达时仍在事务中
+        self.assertEqual(h.conn.rollbacks, 1)
+        self.assertEqual(h.conn.commits, 0)
+        self.assertEqual(cur.feedback, [])        # 未向源库确认，重启后会重新接收
+
     def test_idle_feedback_advances_to_wal_end(self):
         s, h, cur = self._session(start_lsn=100)
         cur.wal_end = 500

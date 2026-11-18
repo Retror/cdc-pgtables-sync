@@ -45,7 +45,7 @@ class Streamer(object):
 
     def request_stop(self, *_args):
         if not self._stop:
-            log.info('收到停止信号，处理完当前事务后退出...')
+            log.info('收到停止信号：事务之间直接退出；正在应用的事务会回滚，重启后重新接收...')
         self._stop = True
 
     def should_stop(self):
@@ -169,7 +169,14 @@ class _Session(object):
     def loop(self, should_stop):
         cur = self.cur
         while True:
-            if should_stop() and not self.in_txn:
+            if should_stop():
+                if self.in_txn:
+                    # 正在接收 / 应用的事务尚未提交到目标库，也未向源库确认，直接回滚即可；
+                    # 重启后源库会从目标库保存的位点重新发送它（以及批次中尚未提交的其他事务）
+                    log.warning('停止时正在应用事务 xid=%d（已处理 %d 条变更），回滚目标库中未提交的部分，'
+                                '重启后会重新接收，不会丢数据', self.txn_xid, self.txn_changes)
+                    self.applier.rollback()
+                    return
                 break
             msg = cur.read_message()
             if msg is not None:

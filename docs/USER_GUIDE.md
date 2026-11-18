@@ -415,7 +415,7 @@ python3 -m pglsync -c $C init --no-copy --recreate-slot    # 核对后从现有�
 #### 前台运行（调试用）
 
 ```bash
-python3 -m pglsync -c $C run          # Ctrl+C 停止，会处理完当前事务再退出
+python3 -m pglsync -c $C run          # Ctrl+C 停止（正在应用的事务会回滚，重启后重新接收）
 python3 -m pglsync -c $C -v run       # 输出每条变更的 DEBUG 日志
 ```
 

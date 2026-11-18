@@ -227,7 +227,7 @@ docker compose logs -f pglsync
 | 查看状态 | `docker compose run --rm pglsync status` |
 | 健康状态 | `docker ps`：STATUS 列显示 `healthy` / `unhealthy`（每 2 分钟执行一次 `status`） |
 | 数据核对 | `docker compose run --rm pglsync reconcile --since 2026-11-01` |
-| 停止 / 启动 / 重启 | `docker compose stop pglsync` / `start` / `restart`（停止时会处理完当前事务、提交位点再退出，最多等待 120 秒） |
+| 停止 / 启动 / 重启 | `docker compose stop pglsync` / `start` / `restart`（停止时：已收到的完整事务先提交；正在应用的事务回滚，重启后重新接收，不会丢数据） |
 | 单表重新复制 | `docker compose stop pglsync` → `docker compose run --rm pglsync resync -t public.new_table` → `docker compose start pglsync` |
 | 修改配置后生效 | `docker compose restart pglsync` |
 | 停用同步 | `docker compose down`，然后 `docker compose run --rm pglsync drop -y`（**必须执行 drop**，否则源库会一直保留 WAL） |
