@@ -34,7 +34,7 @@
 ### 0.2 操作步骤（源库不变，只换目标库）
 
 ```bash
-# ① 停止旧的同步进程（程序会处理完当前事务、提交位点后再退出）
+# ① 停止旧的同步进程（已完成的事务会先提交；正在应用的事务回滚，重启后重新接收）
 sudo systemctl stop pglsync              # 前台运行按 Ctrl+C；Docker 用 docker compose stop pglsync
 python3 -m pglsync -c config.json status # 确认“是否活跃: 否”
 
@@ -182,7 +182,7 @@ sudo systemctl stop pglsync          # systemd 托管时
 # 前台运行的话按 Ctrl+C；Docker：docker compose stop pglsync
 ```
 
-程序会处理完当前事务、提交位点后才退出。确认已经停下：执行 `python3 -m pglsync -c config.json status`，“是否活跃”应该显示“否”。
+已完成的事务会先提交，正在应用的事务会回滚（重启后重新接收，不会丢数据）。确认已经停下：执行 `python3 -m pglsync -c config.json status`，“是否活跃”应该显示“否”。
 
 **③ 新建配置文件，target 指向 C**
 
