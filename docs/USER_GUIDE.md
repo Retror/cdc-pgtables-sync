@@ -8,7 +8,7 @@
 4. 测试写入脚本的使用方式
 5. 端到端测试流程、常见问题排查、生产切换要点
 
-> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [SWITCH_TARGET.md](SWITCH_TARGET.md)（更换 / 新增目标库） · [VERSION_COMPAT.md](VERSION_COMPAT.md)（源库与目标库版本不一致） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
+> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [SWITCH_TARGET.md](SWITCH_TARGET.md)（更换 / 新增目标库） · [VERSION_COMPAT.md](VERSION_COMPAT.md)（源库与目标库版本不一致） · [CASE_LARGE_DELETE.md](CASE_LARGE_DELETE.md)（案例：大批量删除后目标库迟迟没有同步） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
 
 ---
 
