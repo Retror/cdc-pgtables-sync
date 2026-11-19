@@ -8,7 +8,7 @@
 4. 测试写入脚本的使用方式
 5. 端到端测试流程、常见问题排查、生产切换要点
 
-> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [SWITCH_TARGET.md](SWITCH_TARGET.md)（更换 / 新增目标库） · [VERSION_COMPAT.md](VERSION_COMPAT.md)（源库与目标库版本不一致） · [CASE_LARGE_DELETE.md](CASE_LARGE_DELETE.md)（案例：大批量删除后目标库迟迟没有同步） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
+> 相关文档：[LOGICAL_SYNC.md](LOGICAL_SYNC.md)（原理与限制） · [REPLICATION_SLOT.md](REPLICATION_SLOT.md)（复制槽详解） · [SWITCH_TARGET.md](SWITCH_TARGET.md)（更换 / 新增目标库） · [VERSION_COMPAT.md](VERSION_COMPAT.md)（源库与目标库版本不一致） · [CASE_LARGE_DELETE.md](CASE_LARGE_DELETE.md)（案例：大批量删除后目标库迟迟没有同步） · [COPY_AND_BULK_LOAD.md](COPY_AND_BULK_LOAD.md)（COPY 与批量导入） · [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)（生产上线手册） · [TEST_ENV_SETUP.md](TEST_ENV_SETUP.md)（测试环境速查）
 
 ---
 
@@ -782,17 +782,77 @@ python3 -m pglsync -c $C reconcile -t public.new_table
 >
 > 如果 132 上的新表已经有和 131 一致的数据，也不想重新复制，可以用 `init --no-copy --recreate-slot` 代替第 ⑥ 步。但它会核对**所有**表，表多、数据量大时比较慢。
 
-### 8.4 停止同步某张表
+### 8.4 停止同步某些表（去掉同步表）
+
+**要点：**
+
+- 去掉同步表**不需要**重建复制槽，也**不需要**重新 `init`；
+- 其他表不受影响，从断点继续同步；
+- 目标库里这张表的数据会**原样保留**（停在停止同步那一刻的状态），pglsync 不会删除它。
+
+#### 8.4.1 操作步骤
+
+以去掉 `public.old_table` 为例（多张表的做法相同）：
 
 ```bash
-sudo systemctl stop pglsync-test
-# 1. 从 config.test.json 的 tables 中删除这张表
-# 2. 从发布中移除（发布模式为 all 时跳过这一步）
-psql -h 192.168.234.131 -U postgres -d typhoon -c 'ALTER PUBLICATION pglsync_test_pub DROP TABLE public.old_table;'
-sudo systemctl start pglsync-test
+cd /opt/cdc-pgtables-sync && C=config.test.json
+
+# ① 确认当前没有正在处理的大事务（日志里没有“正在应用大事务”，status 中“落后”很小）
+tail -n 20 logs/pglsync-test.log
+python3 -m pglsync -c $C status
+
+# ② 停止同步进程
+kill $(cat logs/pglsync.pid)              # systemd 托管时：sudo systemctl stop pglsync
+sleep 3; pgrep -af "pglsync.*run"         # 没有输出说明已退出
+
+# ③ 从配置文件的 tables 中删掉这张表（建议先备份）
+cp $C $C.bak
+vi $C                                     # 删除 "public.old_table": {...} 这一项，注意前后逗号，保持 JSON 格式正确
+
+# ④ 校验配置并确认表清单（配置有错会直接报错，不会影响源库）
+python3 -m pglsync -c $C check
 ```
 
-目标库里这张表的数据会保持原样，不会被删除。
+```sql
+-- ⑤ 在源库上把这张表从发布中移除（发布模式为 all 时跳过，见 8.4.2 节）
+ALTER PUBLICATION pglsync_test_pub DROP TABLE public.old_table;
+
+-- ⑥（可选）清理这张表的 resync 起点记录（在目标库上执行；没有记录时也不会报错）
+DELETE FROM pglsync.table_state WHERE slot_name = 'pglsync_test_slot' AND table_name = 'public.old_table';
+```
+
+```bash
+# ⑦ 重新启动
+nohup python3 -m pglsync -c $C run > logs/pglsync-run.out 2>&1 &
+echo $! > logs/pglsync.pid
+tail -f logs/pglsync-test.log             # 看到“开始增量同步…”即可
+
+# ⑧ 验证：reconcile 不再包含这张表，其他表一致
+python3 -m pglsync -c $C reconcile
+```
+
+如果这张表正在被 `load_writer` 写入测试数据，记得同时调整它的 `-t` 参数。
+
+#### 8.4.2 发布里移不移除，有什么区别
+
+| 发布模式（`check` 输出中的“发布模式”） | 怎么处理 |
+|---|---|
+| `tables`（没装 TimescaleDB）或 `schema`（PG15+） | 执行第 ⑤ 步，把表从发布中移除，源库就不再解码、发送这张表的变更 |
+| `all`（`FOR ALL TABLES`） | 无法单独移除。pglsync 会根据配置文件忽略这张表的变更，功能上没有影响，只是源库仍会解码、发送它的变更 |
+| 去掉的是**超表**，并且发布模式为 `schema` | 移除的是超表本身；它的 chunk 仍在 `TABLES IN SCHEMA _timescaledb_internal` 的范围内，变更还会发过来，但 pglsync 会根据配置忽略。功能上没有影响 |
+
+**不执行第 ⑤ 步也不会出错**：只要配置文件里去掉了这张表，pglsync 就会忽略它的变更。移除只是为了减少源库解码和网络传输的开销。另外，`setup` 只会**添加**配置中有、发布中没有的表，不会把已移除的表加回来，也不会自动移除表。
+
+#### 8.4.3 需要特别注意的情况
+
+| 情况 | 注意事项 |
+|---|---|
+| **多个目标库共用同一个发布**（见 [SWITCH_TARGET.md](SWITCH_TARGET.md) 场景 B） | 如果其他目标库还要同步这张表，**不要**执行第 ⑤ 步，否则另一条链路也会收不到这张表的变更。只修改当前链路的配置文件即可 |
+| 以后又想重新同步这张表 | 按 [8.3 节](#83-新增一张需要同步的表) 的“新增同步表”流程：加回配置 → `setup` → `resync -t 表名`。中间这段时间源库的变更不会自动补上，`resync` 会用快照重新复制整张表 |
+| 源库直接 `DROP TABLE` 了这张表 | PostgreSQL 会自动把它从发布中移除。但仍要从配置文件中删掉它，否则 `check`、`init`、`reconcile` 会报“源库不存在表” |
+| 目标库这张表也不要了 | pglsync 不会删除目标库的表。确认不再需要后，在目标库手动执行 `DROP TABLE public.old_table;`（或者先改名留作备份） |
+| Java 版 | 从 `application.yml` 的 `pglsync.tables` 列表中删除这一项。注意：外部配置文件里的 `tables` 会**整体替换** jar 内置的列表，要写全所有仍需同步的表 |
+| Docker 部署 | 修改挂载的 `config.json` 后执行 `docker compose restart pglsync`；第 ⑤ 步照常在源库执行 |
 
 ### 8.5 修改表结构（字段）
 
