@@ -12,6 +12,20 @@ PostgreSQL 数据单向同步工具 **pglsync**。它基于 PostgreSQL 逻辑复
 | [docs/TEST_ENV_SETUP.md](docs/TEST_ENV_SETUP.md) | 测试环境（131 → 132）速查 |
 | [pglsync-java/README.md](pglsync-java/README.md) | **Java 版**（Spring Boot 2.7 + JDK 8）：构建、配置、命令写法 |
 
+### 运维与专题
+
+| 文档 | 内容 |
+|---|---|
+| [docs/USER_GUIDE.md 第 8 节](docs/USER_GUIDE.md#8-新增同步表与表结构变更) | 新增同步表、**去掉同步表**（8.4 节）、修改表结构 |
+| [docs/REPLICATION_SLOT.md](docs/REPLICATION_SLOT.md) | 复制槽原理、风险与监控 |
+| [docs/SWITCH_TARGET.md](docs/SWITCH_TARGET.md) | 更换 / 新增目标库，旧复制槽怎么处理 |
+| [docs/SQL_OPERATIONS.md](docs/SQL_OPERATIONS.md) | MERGE、ON CONFLICT、级联删除等各类 SQL 操作的同步情况 |
+| [docs/COPY_AND_BULK_LOAD.md](docs/COPY_AND_BULK_LOAD.md) | COPY 与批量导入 |
+| [docs/CASE_LARGE_DELETE.md](docs/CASE_LARGE_DELETE.md) | 案例复盘：大批量删除后目标库迟迟没有同步 |
+| [docs/VERSION_COMPAT.md](docs/VERSION_COMPAT.md) | 源库与目标库 PostgreSQL 版本不一致 |
+| [docs/OFFLINE_DEPLOY.md](docs/OFFLINE_DEPLOY.md) | 无外网 / 只有 Python 2.7 的机器上部署 |
+| [docs/DOCKER_DEPLOY.md](docs/DOCKER_DEPLOY.md) | Docker 部署 |
+
 ## 两种实现
 
 | 实现 | 目录 | 运行方式 |
