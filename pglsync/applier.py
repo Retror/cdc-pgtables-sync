@@ -72,7 +72,9 @@ class Applier(object):
                 action = 'DO UPDATE SET ' + ', '.join('%s = EXCLUDED.%s' % (qi(c), qi(c)) for c in non_pk)
             else:
                 action = 'DO NOTHING'
-            stmt = 'INSERT INTO %s (%s) VALUES %%s ON CONFLICT (%s) %s' % (
+            # OVERRIDING SYSTEM VALUE：目标表若有 GENERATED ALWAYS 的标识列，也能写入源库的原值
+            #（没有标识列时该子句无任何影响）
+            stmt = 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE VALUES %%s ON CONFLICT (%s) %s' % (
                 table, ', '.join(qi(c) for c in cols), ', '.join(qi(c) for c in info.pk), action)
         elif kind == 'update':
             stmt = 'UPDATE %s SET %s WHERE %s' % (
