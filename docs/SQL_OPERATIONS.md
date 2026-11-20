@@ -35,7 +35,7 @@ flowchart LR
 | pg_bulkload 等直接写数据文件的工具 | ❌ | 绕过了 WAL |
 | DDL（`CREATE` / `ALTER` / `DROP TABLE` 等） | ❌ | 逻辑复制不同步表结构变更，见 [USER_GUIDE.md 第 8.5 节](USER_GUIDE.md#85-修改表结构字段) |
 | `VACUUM` / `ANALYZE` / `REINDEX` / `CLUSTER` | 无需同步 | 不改变数据内容，两边各自维护 |
-| 序列（`nextval`） | ❌ | 序列的当前值不同步。目标库只由 pglsync 写入，一般不需要；如果将来要把目标库切换为主库，需要手动校正序列（`setval`） |
+| 序列（`nextval`） | ❌ | 序列的当前值不同步。目标库只由 pglsync 写入时不需要处理；要把目标库切换为主库时需要调整，见 [SEQUENCES.md](SEQUENCES.md) |
 
 ---
 
