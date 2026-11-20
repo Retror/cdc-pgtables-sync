@@ -49,7 +49,7 @@ class ApplierTest {
         Applier a = new Applier(TestSupport.config(), r);
         a.insert(info(), Arrays.asList(t("1"), t("a"), n()));
         a.commit(16);
-        assertEquals("INSERT INTO \"public\".\"t\" (\"id\", \"name\", \"big\") VALUES (?, ?, ?) "
+        assertEquals("INSERT INTO \"public\".\"t\" (\"id\", \"name\", \"big\") OVERRIDING SYSTEM VALUE VALUES (?, ?, ?) "
                 + "ON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\", \"big\" = EXCLUDED.\"big\"", r.sqls.get(0));
         assertEquals(Arrays.asList("1", "a", null), r.params.get(0));
         assertEquals(1, r.commits);

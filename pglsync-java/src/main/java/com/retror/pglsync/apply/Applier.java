@@ -188,8 +188,9 @@ public class Applier {
     }
 
     static String upsertSql(RelationInfo info, List<String> cols, int nrows) {
+        // OVERRIDING SYSTEM VALUE：目标表若有 GENERATED ALWAYS 的标识列，也能写入源库的原值（没有标识列时无影响）
         StringBuilder sb = new StringBuilder("INSERT INTO ").append(table(info))
-                .append(" (").append(Sql.qcols(cols)).append(") VALUES ");
+                .append(" (").append(Sql.qcols(cols)).append(") OVERRIDING SYSTEM VALUE VALUES ");
         String one = "(" + cols.stream().map(c -> "?").collect(Collectors.joining(", ")) + ")";
         for (int i = 0; i < nrows; i++) {
             if (i > 0) {
